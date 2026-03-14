@@ -1,42 +1,44 @@
 {
-  "model_path": "generalization_eval_best_v3/best_model.zip",
-  "success_rate": 0.0,
-  "avg_reward": 251.1057792510166,
-  "avg_final_dfa_state": 1.4,
+  "model_path": "generalization_eval_best/best_model.zip",
+  "observation_mode": "relative",
+  "n_stack": 4,
+  "success_rate": 0.6,
+  "avg_reward": 2019.594023180008,
+  "avg_final_dfa_state": 2.6,
   "results": [
     {
-      "success": false,
-      "steps": 2000,
-      "total_reward": 1119.3945885690134,
-      "final_dfa_state": 2,
+      "success": true,
+      "steps": 335,
+      "total_reward": 2843.0533680915833,
+      "final_dfa_state": 3,
       "scenario": "baseline_train_layout"
     },
     {
       "success": false,
       "steps": 2000,
-      "total_reward": 529.664698662876,
-      "final_dfa_state": 1,
+      "total_reward": 792.4428826570511,
+      "final_dfa_state": 2,
       "scenario": "shift_tasks_only"
     },
     {
-      "success": false,
-      "steps": 2000,
-      "total_reward": 607.3214412197017,
-      "final_dfa_state": 1,
+      "success": true,
+      "steps": 318,
+      "total_reward": 2852.431943178177,
+      "final_dfa_state": 3,
       "scenario": "shift_obstacles_only"
     },
     {
-      "success": false,
-      "steps": 2000,
-      "total_reward": -1700.6180284941431,
-      "final_dfa_state": 2,
+      "success": true,
+      "steps": 309,
+      "total_reward": 2578.081704854965,
+      "final_dfa_state": 3,
       "scenario": "shift_both_layout"
     },
     {
       "success": false,
       "steps": 2000,
-      "total_reward": 699.7661962976352,
-      "final_dfa_state": 1,
+      "total_reward": 1031.9602171182632,
+      "final_dfa_state": 2,
       "scenario": "hard_ood_layout"
     }
   ]

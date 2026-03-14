@@ -1,10 +1,12 @@
 import gymnasium as gym
+from collections import deque
 from gymnasium import spaces
 import numpy as np
 import pygame
 import math
 import sys
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 
 # --- 环境基础设定 ---
 WIDTH, HEIGHT = 800, 600
@@ -71,8 +73,7 @@ class LTLfGymEnv(gym.Env):
         self.start_pos = (float(start_pos[0]), float(start_pos[1]))
         self.observation_mode = observation_mode
         self.last_collision = 0.0
-        self.num_lidar_rays = 16
-        self.lidar_range = 220.0
+        self.closest_distance = 0.0
         
         # 1. Action Space: 神经网络输出 [-1.0, 1.0] 之间的连续二维向量
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
@@ -92,11 +93,15 @@ class LTLfGymEnv(gym.Env):
         self.tasks = {name: TaskPoint(x, y, name) for name, (x, y) in task_specs.items()}
 
         # 奖励设置
-        self.REWARD_GOAL = 300.0        # 提高最终奖励，鼓励完整任务闭环
-        self.REWARD_TRANSITION = 80.0   # 提高阶段奖励，稳定通过中间目标
-        self.REWARD_COLLISION = -1.5    # 显著提高碰撞代价，鼓励绕障而非硬顶
-        self.REWARD_TIME_STEP = -0.04   # 适度时间惩罚，避免过度追求局部最短路
-        self.POTENTIAL_SCALE = 1.0      # 降低势能牵引，减少被障碍物诱导卡死
+        self.REWARD_GOAL = 200.0        # 提高最终奖励
+        self.REWARD_TRANSITION = 50.0   # 提高阶段奖励
+        self.REWARD_COLLISION = -0.2    # (关键) 大幅降低碰撞惩罚，允许试错
+        self.REWARD_TIME_STEP = -0.1    # (关键) 加大时间惩罚，逼迫它动起来
+        self.POTENTIAL_SCALE = 2.0      # (关键) 加大势能引力   
+        self.REWARD_STAGNATION = -0.5
+        self.position_history = deque(maxlen=60)
+        self.stagnation_std_threshold = 5.0
+        self.front_wall_threshold = 0.12
 
         if self.render_mode == "human":
             pygame.init()
@@ -107,12 +112,38 @@ class LTLfGymEnv(gym.Env):
 
     def _build_observation_space(self):
         if self.observation_mode == "relative":
-            low = np.array([-1.0, -1.0, 0.0, 0.0, 0.0] + [0.0] * 4 + [0.0] * self.num_lidar_rays, dtype=np.float32)
-            high = np.array([1.0, 1.0, 1.0, 1.0, 1.0] + [1.0] * 4 + [1.0] * self.num_lidar_rays, dtype=np.float32)
+            low = np.array([-1.0, -1.0, 0.0, 0.0, 0.0] + [0.0] * 4 + [0.0] * 16 + [0.0, 0.0], dtype=np.float32)
+            high = np.array([1.0, 1.0, 1.0, 1.0, 1.0] + [1.0] * 4 + [1.0] * 16 + [1.0, 1.0], dtype=np.float32)
         else:
-            low = np.array([0.0, 0.0, -1.0, -1.0, 0.0] + [0.0] * self.num_lidar_rays, dtype=np.float32)
-            high = np.array([1.0, 1.0, 1.0, 1.0, 1.0] + [1.0] * self.num_lidar_rays, dtype=np.float32)
+            low = np.array([0.0, 0.0, -1.0, -1.0, 0.0] + [0.0] * 16 + [0.0, 0.0], dtype=np.float32)
+            high = np.array([1.0, 1.0, 1.0, 1.0, 1.0] + [1.0] * 16 + [1.0, 1.0], dtype=np.float32)
         return spaces.Box(low=low, high=high, dtype=np.float32)
+
+    def _is_stagnant(self) -> bool:
+        maxlen = self.position_history.maxlen
+        if maxlen is None:
+            maxlen = 60
+        if len(self.position_history) < maxlen:
+            return False
+
+        positions = np.array(self.position_history, dtype=np.float32)
+        std_sum = float(np.std(positions[:, 0]) + np.std(positions[:, 1]))
+        return std_sum < self.stagnation_std_threshold
+
+    def _front_sector_min_distance(self, lidar_distances, vx: float, vy: float) -> float:
+        if abs(vx) <= 1e-6 and abs(vy) <= 1e-6:
+            return 1.0
+
+        move_angle = math.atan2(vy, vx)
+        num_rays = len(lidar_distances)
+        angle_step = 2 * math.pi / num_rays
+        center_idx = int(round(move_angle / angle_step)) % num_rays
+        sector_half_width = 1
+        front_sector = [lidar_distances[(center_idx + offset) % num_rays] for offset in range(-sector_half_width, sector_half_width + 1)]
+        return float(min(front_sector))
+
+    def _front_sector_blocked(self, lidar_distances, vx: float, vy: float) -> bool:
+        return self._front_sector_min_distance(lidar_distances, vx, vy) < self.front_wall_threshold
 
     def _get_dfa_one_hot(self):
         dfa_one_hot = [0.0] * 4
@@ -129,14 +160,19 @@ class LTLfGymEnv(gym.Env):
             target = self.tasks[target_name]
             dx = (target.x - self.rx) / WIDTH
             dy = (target.y - self.ry) / HEIGHT
+            front_vx = target.x - self.rx
+            front_vy = target.y - self.ry
         else:
             dx, dy = 0.0, 0.0 
+            front_vx, front_vy = 0.0, 0.0
             
         base_obs = [norm_x, norm_y, dx, dy, norm_dfa]
         lidar_obs = self._get_lidar_data()
+        is_stagnant = float(self._is_stagnant())
+        front_blocked = float(self._front_sector_blocked(lidar_obs, front_vx, front_vy))
         
         # 将基础列表和雷达列表拼接后转换为 numpy 数组
-        return np.array(base_obs + lidar_obs, dtype=np.float32)
+        return np.array(base_obs + lidar_obs + [is_stagnant, front_blocked], dtype=np.float32)
 
     def _get_relative_obs(self):
         target_name = self.dfa.get_current_target_name()
@@ -157,7 +193,9 @@ class LTLfGymEnv(gym.Env):
         remaining_time = 1.0 - (self.current_step / self.max_steps)
         lidar_obs = self._get_lidar_data()
         base_obs = [dir_x, dir_y, distance_norm, self.last_collision, remaining_time]
-        return np.array(base_obs + self._get_dfa_one_hot() + lidar_obs, dtype=np.float32)
+        is_stagnant = float(self._is_stagnant())
+        front_blocked = float(self._front_sector_blocked(lidar_obs, dir_x, dir_y))
+        return np.array(base_obs + self._get_dfa_one_hot() + lidar_obs + [is_stagnant, front_blocked], dtype=np.float32)
 
     def _get_obs(self):
         if self.observation_mode == "relative":
@@ -171,6 +209,8 @@ class LTLfGymEnv(gym.Env):
         self.current_step = 0
         self.cumulative_reward = 0.0
         self.last_collision = 0.0
+        self.position_history.clear()
+        self.position_history.append((self.rx, self.ry))
         
         self._update_potential_anchor()
         return self._get_obs(), {}
@@ -179,7 +219,7 @@ class LTLfGymEnv(gym.Env):
         target_name = self.dfa.get_current_target_name()
         if target_name:
             target = self.tasks[target_name]
-            self.prev_distance = math.hypot(self.rx - target.x, self.ry - target.y)
+            self.closest_distance = math.hypot(self.rx - target.x, self.ry - target.y)
 
     def step(self, action):
         self.current_step += 1
@@ -203,9 +243,16 @@ class LTLfGymEnv(gym.Env):
                 self.rx, self.ry = old_x, old_y
                 collided = True
                 break
+
+        self.position_history.append((self.rx, self.ry))
+        lidar_distances = self._get_lidar_data()
+        is_stagnant = self._is_stagnant()
+        front_min_lidar = self._front_sector_min_distance(lidar_distances, vx, vy)
+        front_blocked = self._front_sector_blocked(lidar_distances, vx, vy)
         
         self.last_collision = float(collided)
-        if collided: step_reward += self.REWARD_COLLISION
+        if collided:
+            step_reward += self.REWARD_COLLISION
 
         terminated = False
         truncated = False
@@ -214,11 +261,18 @@ class LTLfGymEnv(gym.Env):
         if target_name:
             target = self.tasks[target_name]
             current_distance = math.hypot(self.rx - target.x, self.ry - target.y)
-            
-            # 势能计算保持不变，因为是相对差值
-            potential_reward = (self.prev_distance - current_distance) * self.POTENTIAL_SCALE
+
+            if is_stagnant or front_blocked:
+                potential_reward = 0.0
+                step_reward += self.REWARD_STAGNATION
+            else:
+                if current_distance < self.closest_distance:
+                    potential_reward = (self.closest_distance - current_distance) * self.POTENTIAL_SCALE
+                    self.closest_distance = current_distance
+                else:
+                    potential_reward = 0.0
+
             step_reward += potential_reward
-            self.prev_distance = current_distance
 
             if current_distance <= (self.robot_radius + target.radius):
                 if self.dfa.step(target_name):
@@ -233,7 +287,14 @@ class LTLfGymEnv(gym.Env):
             truncated = True
 
         self.cumulative_reward += step_reward
-        return self._get_obs(), step_reward, terminated, truncated, {}
+        info = {
+            "dfa_state": int(self.dfa.state),
+            "is_success": bool(terminated and self.dfa.state == self.dfa.accepting_state),
+            "is_stagnant": bool(is_stagnant),
+            "front_blocked": bool(front_blocked),
+            "front_min_lidar": float(front_min_lidar),
+        }
+        return self._get_obs(), step_reward, terminated, truncated, info
 
     def render(self):
         if self.render_mode != "human": return
@@ -255,17 +316,19 @@ class LTLfGymEnv(gym.Env):
         # 【新增代码】：绘制激光雷达 (Lidar) 射线
         # =========================================
         if hasattr(self, 'last_lidar_distances'):
-            for i in range(self.num_lidar_rays):
-                angle = i * (2 * math.pi / self.num_lidar_rays)
+            num_rays = 16
+            max_range = 150.0
+            for i in range(num_rays):
+                angle = i * (2 * math.pi / num_rays)
                 # 将归一化的数据恢复为实际物理像素长度
-                dist = self.last_lidar_distances[i] * self.lidar_range 
+                dist = self.last_lidar_distances[i] * max_range 
                 
                 # 计算射线末端坐标
                 end_x = self.rx + math.cos(angle) * dist
                 end_y = self.ry + math.sin(angle) * dist
                 
                 # 视觉反馈逻辑：如果距离小于最大量程，说明撞墙了，画红色；如果前方畅通，画浅灰色
-                if dist < self.lidar_range:
+                if dist < max_range:
                     line_color = (255, 80, 80)   # 红色警报
                     point_color = (255, 0, 0)
                 else:
@@ -284,16 +347,18 @@ class LTLfGymEnv(gym.Env):
         self.clock.tick(self.metadata["render_fps"])
 
     def _get_lidar_data(self):
+        num_rays = 16
+        max_range = 150.0  # 雷达最大探测距离（像素）
         lidar_distances = []
         
-        for i in range(self.num_lidar_rays):
-            angle = i * (2 * math.pi / self.num_lidar_rays)
+        for i in range(num_rays):
+            angle = i * (2 * math.pi / num_rays)
             ray_dx = math.cos(angle)
             ray_dy = math.sin(angle)
             
-            distance = self.lidar_range
+            distance = max_range
             # 步进探测 (Raymarching)，每次步进 5 个像素
-            for step in range(1, int(self.lidar_range), 5):
+            for step in range(1, int(max_range), 5):
                 test_x = self.rx + ray_dx * step
                 test_y = self.ry + ray_dy * step
                 
@@ -315,7 +380,7 @@ class LTLfGymEnv(gym.Env):
                     break
                     
             # 将测量的距离归一化到 [0, 1]，喂给神经网络更稳定
-            lidar_distances.append(distance / self.lidar_range)
+            lidar_distances.append(distance / max_range)
         self.last_lidar_distances = lidar_distances
         return lidar_distances
 
@@ -329,7 +394,8 @@ class LTLfGymEnv(gym.Env):
 if __name__ == "__main__":
     print("=== 开始训练 PPO 智能体 (关闭画面以全速运行) ===")
     # 训练时使用 render_mode="None" 可以极大提升采样速度
-    train_env = LTLfGymEnv(render_mode="None")
+    train_env = DummyVecEnv([lambda: LTLfGymEnv(render_mode="None")])
+    train_env = VecFrameStack(train_env, n_stack=4)
     
     # 实例化 PPO 模型 (MlpPolicy 适用于一维向量输入)
     model = PPO("MlpPolicy", train_env, verbose=1, learning_rate=3e-4, tensorboard_log="./ppo_ltlf_tensorboard/")
@@ -343,10 +409,11 @@ if __name__ == "__main__":
     train_env.close()
 
     print("\n=== 训练完成！开启 Pygame 画面进行测试 ===")
-    test_env = LTLfGymEnv(render_mode="human")
+    test_env = DummyVecEnv([lambda: LTLfGymEnv(render_mode="human")])
+    test_env = VecFrameStack(test_env, n_stack=4)
     model = PPO.load("ppo_ltlf_agent")
 
-    obs, _ = test_env.reset()
+    obs = test_env.reset()
     for _ in range(2000): # 跑一局测试
         # 处理窗口退出事件
         for event in pygame.event.get():
@@ -357,12 +424,12 @@ if __name__ == "__main__":
         # 让训练好的模型根据 Observation 预测动作 (deterministic=True 表现更稳定)
         action, _states = model.predict(obs, deterministic=True)
         
-        obs, reward, terminated, truncated, info = test_env.step(action)
+        obs, reward, done, info = test_env.step(action)
         test_env.render()
         
-        if terminated or truncated:
+        if done[0]:
             print("回合结束！准备重置...")
             pygame.time.wait(1000) # 停顿一秒让你看清胜利画面
-            obs, _ = test_env.reset()
+            obs = test_env.reset()
 
     test_env.close()

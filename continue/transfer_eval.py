@@ -4,8 +4,22 @@ from pathlib import Path
 
 import numpy as np
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 
 from mutiple_train import LTLfGymEnv
+
+
+OBSERVATION_DIMS = {
+    "absolute": 23,
+    "relative": 27,
+}
+
+
+def get_base_env(vec_env):
+    current = vec_env
+    while hasattr(current, "venv"):
+        current = current.venv
+    return current.envs[0]
 
 
 EVAL_SCENARIOS = [
@@ -82,32 +96,45 @@ EVAL_SCENARIOS = [
 ]
 
 
-def run_episode(model, scenario, render=False, observation_mode="absolute"):
-    env = LTLfGymEnv(
-        render_mode="human" if render else "None",
-        obstacles=scenario["obstacles"],
-        tasks=scenario["tasks"],
-        start_pos=scenario.get("start_pos", (100.0, 100.0)),
-        max_steps=scenario.get("max_steps", 2000),
+def make_vec_env(scenario, observation_mode: str, n_stack: int, render: bool = False):
+    def _init():
+        return LTLfGymEnv(
+            render_mode="human" if render else "None",
+            obstacles=scenario["obstacles"],
+            tasks=scenario["tasks"],
+            start_pos=scenario.get("start_pos", (100.0, 100.0)),
+            max_steps=scenario.get("max_steps", 2000),
+            observation_mode=observation_mode,
+        )
+
+    env = DummyVecEnv([_init])
+    if n_stack > 1:
+        env = VecFrameStack(env, n_stack=n_stack)
+    return env
+
+
+def run_episode(model, scenario, render=False, observation_mode="absolute", n_stack: int = 1):
+    env = make_vec_env(
+        scenario,
         observation_mode=observation_mode,
+        n_stack=n_stack,
+        render=render,
     )
-    obs, _ = env.reset()
+    obs = env.reset()
     total_reward = 0.0
     success = False
     steps = 0
+    base_env = get_base_env(env)
+    final_dfa_state = int(base_env.dfa.state)
 
-    for steps in range(1, env.max_steps + 1):
+    for steps in range(1, base_env.max_steps + 1):
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, _ = env.step(action)
-        total_reward += reward
+        obs, reward, done, infos = env.step(action)
+        total_reward += float(reward[0])
+        final_dfa_state = int(infos[0].get("dfa_state", final_dfa_state))
 
-        if render:
-            env.render()
-
-        if terminated:
-            success = True
-            break
-        if truncated:
+        if done[0]:
+            success = bool(infos[0].get("is_success", False))
             break
 
     env.close()
@@ -115,38 +142,59 @@ def run_episode(model, scenario, render=False, observation_mode="absolute"):
         "success": success,
         "steps": steps,
         "total_reward": float(total_reward),
-        "final_dfa_state": int(env.dfa.state),
+        "final_dfa_state": final_dfa_state,
     }
 
 
-def resolve_observation_mode(model, observation_mode=None):
+def resolve_observation_config(model, observation_mode=None, n_stack=None):
     obs_shape = getattr(model.observation_space, "shape", None)
     obs_dim = obs_shape[0] if obs_shape else None
-    mode_to_dims = {"absolute": {13, 21}, "relative": {17, 25}}
+
+    if obs_dim is None:
+        raise ValueError("模型 observation_space 没有可用的 shape，无法推断配置")
 
     if observation_mode is None:
-        if obs_dim in mode_to_dims["absolute"]:
-            return "absolute"
-        if obs_dim in mode_to_dims["relative"]:
-            return "relative"
-        raise ValueError(f"无法根据模型观测维度 {obs_dim} 自动判断 observation_mode")
+        matches = []
+        for mode, base_dim in OBSERVATION_DIMS.items():
+            if obs_dim % base_dim == 0:
+                inferred_stack = obs_dim // base_dim
+                matches.append((mode, inferred_stack))
 
-    expected_dims = mode_to_dims[observation_mode]
-    if obs_dim not in expected_dims:
+        if len(matches) != 1:
+            raise ValueError(f"无法根据模型观测维度 {obs_dim} 自动判断 observation_mode 和 n_stack")
+
+        inferred_mode, inferred_stack = matches[0]
+    else:
+        base_dim = OBSERVATION_DIMS[observation_mode]
+        if obs_dim % base_dim != 0:
+            raise ValueError(
+                f"模型期望观测维度为 {obs_dim}，但当前 observation_mode='{observation_mode}' "
+                f"的单帧维度为 {base_dim}，无法整除。"
+            )
+        inferred_mode = observation_mode
+        inferred_stack = obs_dim // base_dim
+
+    if n_stack is not None and inferred_stack != n_stack:
         raise ValueError(
-            f"模型期望观测维度为 {obs_dim}，但当前 observation_mode='{observation_mode}' 允许的维度为 {sorted(expected_dims)}。"
-            f"请改用 observation_mode='{'relative' if obs_dim in mode_to_dims['relative'] else 'absolute'}'。"
+            f"模型推断的 n_stack 为 {inferred_stack}，但收到 n_stack={n_stack}。"
         )
-    return observation_mode
+
+    return inferred_mode, inferred_stack
 
 
-def evaluate(model_path, render_first=False, observation_mode="absolute"):
+def evaluate(model_path, render_first=False, observation_mode=None, n_stack=None):
     model = PPO.load(model_path, device="cpu")
-    observation_mode = resolve_observation_mode(model, observation_mode)
+    observation_mode, n_stack = resolve_observation_config(model, observation_mode, n_stack)
     results = []
 
     for idx, scenario in enumerate(EVAL_SCENARIOS):
-        result = run_episode(model, scenario, render=render_first and idx == 0, observation_mode=observation_mode)
+        result = run_episode(
+            model,
+            scenario,
+            render=render_first and idx == 0,
+            observation_mode=observation_mode,
+            n_stack=n_stack,
+        )
         result["scenario"] = scenario["name"]
         results.append(result)
 
@@ -156,6 +204,8 @@ def evaluate(model_path, render_first=False, observation_mode="absolute"):
 
     summary = {
         "model_path": str(model_path),
+        "observation_mode": observation_mode,
+        "n_stack": int(n_stack),
         "success_rate": float(success_rate),
         "avg_reward": float(avg_reward),
         "avg_final_dfa_state": float(avg_final_dfa),
@@ -166,16 +216,23 @@ def evaluate(model_path, render_first=False, observation_mode="absolute"):
 
 def main():
     parser = argparse.ArgumentParser(description="评估 PPO 模型在新障碍/目标布局下的迁移能力")
-    parser.add_argument("--model-path", default="generalization_eval_best_v3/best_model.zip", help="已训练模型路径")
+    parser.add_argument("--model-path", default="generalization_eval_best/best_model.zip", help="已训练模型路径")
     parser.add_argument("--observation-mode", choices=["absolute", "relative"], default=None, help="评估时使用的观测模式；不填时自动根据模型推断")
+    parser.add_argument("--n-stack", type=int, default=None, help="Frame stack 数量；不填时自动根据模型推断")
     parser.add_argument("--render-first", action="store_true", help="渲染第一个测试场景")
     parser.add_argument("--save-json", default="transfer_eval_results.json", help="结果保存路径")
     args = parser.parse_args()
 
-    summary = evaluate(args.model_path, render_first=args.render_first, observation_mode=args.observation_mode)
+    summary = evaluate(
+        args.model_path,
+        render_first=args.render_first,
+        observation_mode=args.observation_mode,
+        n_stack=args.n_stack,
+    )
 
     print("=== 迁移测试结果 ===")
     print(f"模型: {summary['model_path']}")
+    print(f"观测模式: {summary['observation_mode']} | n_stack: {summary['n_stack']}")
     print(f"成功率: {summary['success_rate']:.2%}")
     print(f"平均回报: {summary['avg_reward']:.2f}")
     print(f"平均最终 DFA 状态: {summary['avg_final_dfa_state']:.2f} / 3")

@@ -2,280 +2,331 @@
 
 ## 1. 项目概述
 
-本项目实现了一个基于 **PPO (Proximal Policy Optimization)** 算法的强化学习智能体，用于在二维连续空间中完成 **LTLf (Linear Temporal Logic over finite traces)** 任务序列。具体任务要求机器人按照 `Task A → Task B → Task C` 的顺序依次到达三个目标点，同时需要避开障碍物。
+本项目实现了一个基于 PPO（Proximal Policy Optimization）的二维连续空间导航智能体。机器人需要在避障的同时，按照 `Task A -> Task B -> Task C` 的顺序依次完成 LTLf 任务点触发。
 
-项目核心特点是 **域随机化 (Domain Randomization)** 与 **课程学习 (Curriculum Learning)** 的结合，训练出的智能体具有很强的 **泛化能力**，能够在未见过的障碍物和目标点布局中成功完成任务。
+当前版本重点解决两个问题：
+
+- 机器人在 U 型弯或死角中容易震荡、停滞，不愿意后退脱困
+- 稀疏雷达和无时序记忆会让策略难以识别“前方堵死但需要撤退”的状态
+
+为此，代码已经升级为：
+
+- **16 束激光雷达**，提高障碍边缘感知密度
+- **VecFrameStack 4 帧堆叠**，使用 Stable-Baselines3 官方时序包装器提供短期记忆
+- **停滞检测 + 前方扇区阻塞检测**，辅助策略识别卡死状态
+- **势能截断 + 停滞惩罚**，避免在死角里被欧氏距离势能“锁死”
 
 ---
 
-## 2. 代码文件结构
+## 2. 代码结构
 
-```
+```text
 .
-├── mutiple_train.py           # 基础环境定义与单智能体训练入口
-├── generalization_train.py   # 泛化训练主程序（推荐使用）
-├── transfer_eval.py          # 迁移评估脚本
-├── plot_transfer_results.py  # 生成HTML可视化报告
-├── record_agent.py           # 录制智能体行为GIF动画
+├── mutiple_train.py           # 基础环境、单场景训练与可视化测试
+├── generalization_train.py    # 泛化训练主程序（推荐使用）
+├── transfer_eval.py           # 模型迁移评估脚本
+├── plot_transfer_results.py   # 将评估结果生成 HTML 报告
+├── record_agent.py            # 录制策略回放 GIF
 └── test/
-    ├── base_env.py            # 基础物理环境测试
-    ├── reward_base_env.py    # 奖励机制测试
+    ├── base_env.py            # 基础物理环境交互测试
+    ├── reward_base_env.py     # 奖励塑形测试
     └── muti_reward_base_env.py # 多任务奖励测试
 ```
 
 ---
 
-## 3. 核心组件详解
+## 3. 环境设计
 
-### 3.1 环境定义 (`mutiple_train.py`)
+### 3.1 连续动力学
 
-#### 3.1.1 LTLfGymEnv 类
+- 机器人状态是连续位置 `(x, y)`
+- 动作为二维连续速度控制 `[-1, 1] x [-1, 1]`
+- 最大速度 `robot_vmax = 250.0`
+- 积分步长 `dt = 1 / 60`
+- 撞墙或撞障碍后会回退到上一步位置，保持不可穿透
 
-这是核心环境类，继承自 `gymnasium.Env`，封装了以下功能：
+### 3.2 DFA 任务状态机
 
-**物理系统：**
-- **连续状态空间**：机器人位置 `(x, y)` 使用浮点数表示
-- **连续动作空间**：神经网络输出二维向量 `[-1, 1] × [-1, 1]`，映射为速度向量
-- **最大速度**：250 像素/秒，时间步长 `dt = 1/60` 秒
+环境内部使用一个简单 DFA 表示任务进度：
 
-**观测空间 (Observation Space)：**
-项目支持两种观测模式：
-
-1. **absolute 模式** (13维/21维)
-   - 归一化机器人位置 `(x/width, y/height)`
-   - 归一化目标相对位置 `(dx/width, dy/height)`
-   - DFA状态 `state/3.0`
-   - 16束激光雷达数据
-
-2. **relative 模式** (17维/25维) - **推荐使用**
-   - 目标方向单位向量 `(dir_x, dir_y)`
-   - 归一化距离 `distance / sqrt(width² + height²)`
-   - 碰撞标志 `last_collision`
-   - 剩余时间比例 `remaining_time`
-   - DFA状态 one-hot 编码 (4维)
-   - 16束激光雷达数据
-
-#### 3.1.2 DFA (Deterministic Finite Automaton)
-
-使用确定性有限自动机维护任务进度：
-
-```
+```text
 State 0: 等待完成 Task A
-State 1: Task A 已完成，等待 Task B  
-State 2: Task A,B 已完成，等待 Task C
-State 3 (Accepting): 全部完成
+State 1: Task A 已完成，等待 Task B
+State 2: Task A、B 已完成，等待 Task C
+State 3: 全部完成（accepting）
 ```
 
-#### 3.1.3 奖励机制
+只有按顺序触发任务点，状态才会推进。
 
-| 奖励类型 | 数值 | 说明 |
-|---------|------|------|
-| `REWARD_GOAL` | +300.0 | 完成全部三个任务 |
-| `REWARD_TRANSITION` | +80.0 | 完成单个中间任务 |
-| `REWARD_COLLISION` | -1.5 | 发生碰撞 |
-| `REWARD_TIME_STEP` | -0.04 | 每时间步的惩罚 |
-| `POTENTIAL_SCALE` | 1.0 | 势能奖励系数 |
+### 3.3 观测空间
 
-**势能奖励**：`(previous_distance - current_distance) * POTENTIAL_SCALE`，引导机器人朝目标方向移动。
+当前环境支持两种观测模式。
 
-#### 3.1.4 激光雷达 (Lidar)
+#### absolute 模式（单帧 23 维）
 
-- **16束射线**，均匀分布在 360° 范围内
-- **最大探测距离**：220 像素
-- **探测方式**：Raymarching，步长 5 像素
-- **归一化输出**：距离 / 220.0 ∈ [0, 1]
+- 归一化机器人位置 `(x / width, y / height)`
+- 归一化目标偏移 `(dx / width, dy / height)`
+- DFA 标量状态 `state / 3.0`
+- 16 束激光雷达
+- `is_stagnant`：是否停滞
+- `front_blocked`：前方扇区是否被近距离障碍阻塞
+
+#### relative 模式（单帧 27 维，推荐）
+
+- 当前目标方向单位向量 `(dir_x, dir_y)`
+- 归一化目标距离
+- 碰撞标志 `last_collision`
+- 剩余时间比例 `remaining_time`
+- DFA one-hot 编码（4 维）
+- 16 束激光雷达
+- `is_stagnant`
+- `front_blocked`
+
+### 3.4 Frame Stack 后的实际输入维度
+
+训练代码默认使用 `VecFrameStack(n_stack=4)`，因此实际送入策略网络的是 4 帧堆叠观测：
+
+- `absolute`: `23 x 4 = 92` 维
+- `relative`: `27 x 4 = 108` 维
+
+这意味着旧版模型（8 雷达、无停滞特征、无 frame stack）与当前环境**不兼容**，需要重新训练。
 
 ---
 
-### 3.2 泛化训练 (`generalization_train.py`)
+## 4. 反死锁机制
 
-#### 3.2.1 RandomizedLTLfGymEnv 类
+### 4.1 停滞检测
 
-继承自 `LTLfGymEnv`，通过以下方式实现域随机化：
+环境内部维护一个 `collections.deque(maxlen=60)`，记录过去约 1 秒的位置历史。
 
-**训练布局库 (TRAIN_LAYOUT_LIBRARY)：**
+- 每一步把 `(self.rx, self.ry)` 写入滑动窗口
+- 当窗口满 60 帧时，计算 X/Y 坐标标准差之和
+- 如果标准差之和小于阈值 `5.0`，则判定为停滞震荡
 
-包含8种不同难度的障碍物布局，每种布局有不同权重：
+### 4.2 前方扇区阻塞检测
 
-| 布局名称 | 权重 | 特点 |
-|---------|------|------|
-| baseline | 0.10 | 基准简单布局 |
-| center_corridor | 0.08 | 中心走廊 |
-| hard_ood_seed | 0.18 | 高难度分布外 |
-| narrow_upper_gate | 0.12 | 狭窄上门 |
-| u_shaped_trap | 0.15 | U形陷阱 |
-| long_detour | 0.14 | 长绕行 |
-| double_passage | 0.13 | 双重通道 |
-| offset_maze | 0.10 | 偏移迷宫 |
+相比“只看正前方一束雷达”，当前版本使用前进方向附近的一个小扇区：
 
-**随机化策略：**
+- 先根据动作方向（step 中）或目标方向（obs 中）找到前方中心角
+- 取该方向附近 3 束雷达
+- 使用这个扇区里的**最小距离**作为前方拥堵判断依据
 
-1. **布局采样**：按权重从库中随机选择布局
-2. **对称变换**：随机进行 X轴/Y轴 翻转 (50%概率)
-3. **位置扰动**：基于课程学习的进度，逐步增加扰动幅度
+当前默认阈值：
 
-#### 3.2.2 课程学习 (Curriculum Learning)
+- `front_wall_threshold = 0.12`
+
+### 4.3 势能截断与停滞惩罚
+
+原始势能奖励是：
 
 ```python
-scale = min(1.0, episode_count / curriculum_episodes)
+potential_reward = (self.prev_distance - current_distance) * self.POTENTIAL_SCALE
 ```
 
-- **前 8000 个 episode**：扰动幅度从 0 逐渐增加到最大值
-- **8000 个 episode 后**：达到最大随机化程度
+但在 U 型弯中，真正的脱困动作往往会暂时增加目标距离，因此当前版本改成：
 
-**扰动参数：**
-- `obstacle_shift`: 180 像素
-- `task_shift`: 220 像素  
-- `start_shift`: 110 像素
+- 如果 `is_stagnant == True`，或 `front_blocked == True`
+  - 将 `potential_reward` 强制设为 `0`
+  - 追加 `REWARD_STAGNATION = -0.5`
+- 否则，正常计算欧氏距离势能奖励
 
-#### 3.2.3 验证布局 (VALIDATION_LAYOUTS)
-
-包含4种验证场景，用于评估泛化能力：
-
-1. `val_baseline` - 基准布局
-2. `val_shift_obstacles` - 仅移动障碍物
-3. `val_shift_both` - 同时移动障碍物和目标
-4. `val_hard_ood` - 高难度分布外场景
+这样可以打断“越靠近目标越有利”的局部贪心陷阱，鼓励策略主动倒车、横移或转向脱困。
 
 ---
 
-### 3.3 PPO 训练配置
+## 5. 奖励设计
+
+`mutiple_train.py` 中当前主要奖励参数为：
+
+| 奖励项 | 当前值 | 说明 |
+|---|---:|---|
+| `REWARD_GOAL` | `200.0` | 完成全部任务 |
+| `REWARD_TRANSITION` | `50.0` | 完成中间任务 |
+| `REWARD_COLLISION` | `-0.2` | 碰撞惩罚 |
+| `REWARD_TIME_STEP` | `-0.1` | 时间步惩罚 |
+| `POTENTIAL_SCALE` | `2.0` | 势能奖励系数 |
+| `REWARD_STAGNATION` | `-0.5` | 停滞/前堵惩罚 |
+
+这些值是当前代码中的默认值，不一定是最终最优解，但适合作为目前训练基线。
+
+---
+
+## 6. 泛化训练
+
+`generalization_train.py` 定义了 `RandomizedLTLfGymEnv`，在基础环境上加入了布局随机化与课程学习。
+
+### 6.1 随机化内容
+
+- 从 `LAYOUT_LIBRARY` 中采样基础障碍和任务模板
+- 随机进行水平/垂直镜像
+- 随课程进度逐步扩大：
+  - 障碍物偏移
+  - 起点偏移
+  - 任务点偏移
+
+### 6.2 当前训练配置
+
+当前主训练入口使用：
+
+- `DummyVecEnv`：8 个并行环境
+- `VecMonitor`
+- `VecFrameStack(n_stack=4)`
+- `PPO("MlpPolicy", ...)`
+
+核心超参数：
 
 ```python
 model = PPO(
-    "MlpPolicy",           # 多层感知机策略网络
-    vec_env,               # 向量化环境 (8个并行环境)
-    learning_rate=1e-4,    # 学习率
-    n_steps=2048,          # 每次收集的步数
-    batch_size=256,        # 批次大小
-    gamma=0.99,            # 折扣因子
-    gae_lambda=0.95,       # GAE 参数
-    ent_coef=0.02,         # 熵系数 (鼓励探索)
-    use_sde=True,          # 状态依赖的探索
-    sde_sample_freq=4,    # 探索噪声采样频率
-    device="cuda",         # 使用GPU训练
-    policy_kwargs=dict(
-        net_arch=dict(
-            pi=[256, 256, 256],   # 策略网络: 3层256神经元
-            vf=[256, 256, 256]    # 价值网络: 3层256神经元
-        )
-    ),
-    tensorboard_log="./ppo_ltlf_tensorboard_generalization_v3/"
+    "MlpPolicy",
+    vec_env,
+    verbose=1,
+    learning_rate=3e-4,
+    n_steps=2048,
+    batch_size=256,
+    gamma=0.99,
+    gae_lambda=0.95,
+    ent_coef=0.01,
+    policy_kwargs=dict(net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128])),
+    tensorboard_log="./ppo_ltlf_tensorboard_generalization_v2/",
 )
 ```
 
+训练输出：
+
+- 最佳模型目录：`generalization_eval_best/`
+- 评估日志目录：`generalization_eval_logs/`
+- 最终模型文件：`ppo_ltlf_agent_generalization_v2_relative.zip`
+
 ---
 
-## 4. 训练流程详解
+## 7. 安装依赖
 
-### 4.1 一步一训练流程
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        PPO 训练主循环                            │
-├─────────────────────────────────────────────────────────────────┤
-│ 1. 环境交互阶段                                                 │
-│    ┌─────────────────────────────────────────────────────────┐  │
-│    │ for each timestep in n_steps (2048):                    │  │
-│    │   - 环境.reset() → 获取初始观测                         │  │
-│    │   - model.predict(obs) → 获取动作                      │  │
-│    │   - 环境.step(action) → 获取 (obs, reward, done, info)  │  │
-│    │   - 存储 (obs, action, reward, value, log_prob)         │  │
-│    └─────────────────────────────────────────────────────────┘  │
-│                              ↓                                   │
-│ 2. 优势估计与价值更新                                           │
-│    ┌─────────────────────────────────────────────────────────┐  │
-│    │   GAE = Σ (γλ)^t * (reward + γ*V(s') - V(s))           │  │
-│    │   使用 Generalized Advantage Estimation                │  │
-│    └─────────────────────────────────────────────────────────┘  │
-│                              ↓                                   │
-│ 3. 策略优化阶段                                                 │
-│    ┌─────────────────────────────────────────────────────────┐  │
-│    │   Loss = -min(r(θ)*A, clip(r(θ),1-ε,1+ε)*A)           │  │
-│    │   + 0.5*ValueLoss + 0.01*EntropyLoss                   │  │
-│    │   使用 Adam 优化器更新神经网络参数                       │  │
-│    └─────────────────────────────────────────────────────────┘  │
-│                              ↓                                   │
-│ 4. 评估阶段 (EvalCallback)                                      │
-│    ┌─────────────────────────────────────────────────────────┐  │
-│    │   每 20,000 步：                                         │  │
-│    │   - 在验证布局上运行 2*4=8 个 episode                   │  │
-│    │   - 计算平均成功率、回报                                 │  │
-│    │   - 保存 best_model.zip (如果性能提升)                   │  │
-│    └─────────────────────────────────────────────────────────┘  │
-│                              ↓                                   │
-│ 5. 循环直到 total_timesteps (2,500,000)                         │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 4.2 泛化训练的随机化流程
-
-每个 episode 开始时 (`env.reset()`)：
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    单个 Episode 的初始化流程                     │
-├─────────────────────────────────────────────────────────────────┤
-│ 1. 课程进度计算                                                 │
-│    scale = min(1.0, episode_count / 8000)                       │
-│    (8000 episodes 前，扰动幅度逐渐增加)                          │
-│                              ↓                                   │
-│ 2. 布局模板采样                                                 │
-│    - 按权重从8种布局中随机选择                                   │
-│    - 随机决定是否 X轴翻转、Y轴翻转                              │
-│                              ↓                                   │
-│ 3. 障碍物位置扰动                                               │
-│    - 对每个障碍物：                                             │
-│      dx = random(-180, 181) * scale                             │
-│      dy = random(-180, 181) * scale                             │
-│    - 检验与其它障碍物是否重叠                                    │
-│    - 确保不超出边界                                             │
-│                              ↓                                   │
-│ 4. 起点位置扰动                                                 │
-│    - 在扰动范围内随机生成起点                                   │
-│    - 确保不与障碍物碰撞                                         │
-│                              ↓                                   │
-│ 5. 任务点位置扰动                                               │
-│    - 对每个任务点进行扰动                                       │
-│    - 确保不与障碍物碰撞                                         │
-│    - 确保与起点和其他任务点保持距离                             │
-│                              ↓                                   │
-│ 6. 返回初始观测，Episode 开始                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 4.3 训练启动命令
+基础依赖：
 
 ```bash
-cd /home/vamper/robot\ skill/continue
+pip install gymnasium stable-baselines3 numpy pygame imageio torch tensorboard
+```
+
+如果你还要运行 `sample/phase3_single_agent_rl.py`，还需要：
+
+```bash
+pip install spot
+```
+
+---
+
+## 8. 如何训练
+
+### 8.1 训练基础版环境
+
+在 `continue/` 目录下运行：
+
+```bash
+python mutiple_train.py
+```
+
+这个脚本会：
+
+- 创建 `DummyVecEnv + VecFrameStack(4)` 的训练环境
+- 训练一个基础 PPO 模型
+- 保存为 `ppo_ltlf_agent.zip`
+- 然后启动一个带 Pygame 窗口的回放测试
+
+### 8.2 训练泛化版环境（推荐）
+
+```bash
 python generalization_train.py
 ```
 
-训练过程中：
-- TensorBoard 日志保存在 `./ppo_ltlf_tensorboard_generalization_v3/`
-- 最佳模型保存在 `./generalization_eval_best_v3/best_model.zip`
-- 评估日志保存在 `./generalization_eval_logs_v3/evaluations.npz`
+这个脚本会：
+
+- 使用 8 个并行随机化环境训练
+- 自动进行周期性评估
+- 将最佳模型保存到 `generalization_eval_best/best_model.zip`
+- 最终导出 `ppo_ltlf_agent_generalization_v2_relative.zip`
 
 ---
 
-## 5. 评估与可视化
+## 9. 如何评估新模型
 
-### 5.1 迁移评估
+`transfer_eval.py` 已更新为支持：
+
+- 新版单帧观测维度（23/27）
+- `VecFrameStack`
+- 自动从模型输入维度推断 `observation_mode` 和 `n_stack`
+
+### 9.1 自动推断配置评估
 
 ```bash
 python transfer_eval.py \
-    --model-path generalization_eval_best_v3/best_model.zip \
+    --model-path ppo_ltlf_agent_generalization_v2_relative.zip
+```
+
+### 9.2 显式指定 relative + 4-stack
+
+```bash
+python transfer_eval.py \
+    --model-path ppo_ltlf_agent_generalization_v2_relative.zip \
+    --observation-mode relative \
+    --n-stack 4
+```
+
+### 9.3 渲染第一个测试场景
+
+```bash
+python transfer_eval.py \
+    --model-path ppo_ltlf_agent_generalization_v2_relative.zip \
     --render-first
 ```
 
-测试场景包括：
-1. `baseline_train_layout` - 训练时见过的基准布局
-2. `shift_tasks_only` - 仅移动任务点位置
-3. `shift_obstacles_only` - 仅移动障碍物位置
-4. `shift_both_layout` - 同时移动障碍物和任务点
-5. `hard_ood_layout` - 高难度分布外布局
+### 9.4 保存 JSON 结果
 
-### 5.2 生成可视化报告
+```bash
+python transfer_eval.py \
+    --model-path ppo_ltlf_agent_generalization_v2_relative.zip \
+    --save-json transfer_eval_results.json
+```
+
+输出 JSON 里会额外记录：
+
+- `observation_mode`
+- `n_stack`
+- 每个场景的 `success`
+- `steps`
+- `total_reward`
+- `final_dfa_state`
+
+---
+
+## 10. 如何录制 GIF 回放
+
+`record_agent.py` 也已经适配新的观测结构和 frame stack。
+
+### 10.1 自动推断
+
+```bash
+python record_agent.py \
+    --model-path ppo_ltlf_agent_generalization_v2_relative.zip \
+    --scenario hard_ood_layout \
+    --gif-name agent_trajectory.gif
+```
+
+### 10.2 显式指定
+
+```bash
+python record_agent.py \
+    --model-path ppo_ltlf_agent_generalization_v2_relative.zip \
+    --scenario hard_ood_layout \
+    --observation-mode relative \
+    --n-stack 4 \
+    --gif-name agent_trajectory.gif
+```
+
+---
+
+## 11. 生成 HTML 报告
+
+先评估生成 JSON，再执行：
 
 ```bash
 python plot_transfer_results.py \
@@ -283,90 +334,52 @@ python plot_transfer_results.py \
     --output transfer_eval_report.html
 ```
 
-生成的 HTML 报告包含：
-- 成功率、平均回报等指标卡片
-- 每个场景的详细结果表格
-- 回报和 DFA 进度的条形图可视化
+HTML 报告会展示：
 
-### 5.3 录制 GIF 动画
+- 成功率
+- 平均回报
+- 平均最终 DFA 状态
+- 每个场景的回报条形图与 DFA 进度条
+
+---
+
+## 12. 常用测试脚本
+
+这些不是 pytest 测试，而是交互式脚本：
 
 ```bash
-python record_agent.py \
-    --model-path generalization_eval_best_v3/best_model.zip \
-    --scenario hard_ood_layout \
-    --gif-name agent_trajectory.gif
+python test/base_env.py
+python test/reward_base_env.py
+python test/muti_reward_base_env.py
 ```
 
----
+如果你只是想快速检查语法：
 
-## 6. 泛化原理分析
-
-### 6.1 为什么能泛化？
-
-1. **状态表示的泛化性**
-   - 使用 **相对观测**（目标方向、距离、激光雷达）而非绝对坐标
-   - 智能体学习的是"如何应对当前感知到的环境状态"而非"如何执行固定路径"
-
-2. **域随机化的覆盖**
-   - 8种不同布局 + 随机扰动覆盖了大部分可能的障碍物配置
-   - 对称变换进一步增强了数据多样性
-
-3. **课程学习的渐进性**
-   - 从简单场景开始，逐步增加难度
-   - 智能体先学习基本技能（避障、导航），再适应复杂变化
-
-4. **激光雷达感知的通用性**
-   - 16束激光雷达提供与具体障碍物形状无关的通用感知
-   - 无论障碍物如何变化，激光雷达数据格式保持一致
-
-### 6.2 关键设计决策
-
-| 设计 | 作用 |
-|------|------|
-| relative 观测模式 | 使智能体不依赖绝对位置，适应环境变换 |
-| 势能奖励 | 提供稠密奖励信号，加速学习 |
-| 熵系数 0.02 | 保持适度探索，避免过早收敛 |
-| 课程学习 | 从易到难，确保智能体学到正确策略 |
-| 验证布局评估 | 监控泛化性能，及时保存最佳模型 |
-
----
-
-## 7. 依赖库
-
-```
-gymnasium
-stable-baselines3
-numpy
-pygame
-imageio
-torch (stable-baselines3 依赖)
-tensorboard
-```
-
-安装命令：
 ```bash
-pip install gymnasium stable-baselines3 numpy pygame imageio
+python -m py_compile *.py test/*.py
 ```
 
 ---
 
-## 8. 训练技巧与注意事项
+## 13. 使用建议
 
-1. **GPU 训练**：代码默认使用 CUDA，若无 GPU 可改为 `device="cpu"`
-2. **并行环境**：8个并行环境可显著加速采样
-3. **评估频率**：每 20,000 步评估一次，避免过于频繁影响训练速度
-4. **Early Stopping**：可通过监控验证成功率来提前停止训练
-5. **render_mode**：`render_mode="None"` 可大幅提升训练速度
+1. **优先训练泛化版**：`generalization_train.py` 比基础单场景训练更接近最终目标
+2. **重新训练而不是复用旧模型**：当前环境维度和输入结构已经变化
+3. **优先使用 relative 模式**：它对布局变化更鲁棒
+4. **观察停滞惩罚是否过强**：如果机器人过于激进，可适当减小 `REWARD_STAGNATION`
+5. **检查前方扇区阈值**：若过于敏感，可调 `front_wall_threshold`
+6. **关注 TensorBoard**：看 reward 曲线是否出现长时间停滞
 
 ---
 
-## 9. 总结
+## 14. 当前版本总结
 
-本项目展示了如何结合 **域随机化**、**课程学习** 和 **PPO 算法** 训练具有强泛化能力的机器人导航智能体。关键在于：
+当前框架已经从“单帧、低密度雷达、纯欧氏势能”的 PPO 导航环境，升级为：
 
-1. 设计与具体坐标无关的状态表示
-2. 在训练时充分随机化环境参数
-3. 使用课程学习渐进增加难度
-4. 通过验证布局持续监控泛化性能
+- 16 雷达高密度感知
+- 4 帧时序堆叠
+- 显式停滞/前堵状态特征
+- 势能截断与停滞惩罚联动
+- 自动适配新模型维度的评估与 GIF 回放脚本
 
-这样训练出的智能体不仅能在训练分布内完成任务，还能很好地泛化到未见过的环境配置中。
+这套设计更适合训练能够在 U 型弯、死胡同和复杂障碍布局中主动脱困的连续控制导航策略。
