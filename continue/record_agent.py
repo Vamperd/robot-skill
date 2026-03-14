@@ -56,8 +56,8 @@ def record_gif(model_path, scenario_name="baseline_train_layout", gif_name="agen
 
 def main():
     parser = argparse.ArgumentParser(description="录制强化学习策略在指定场景中的回放 GIF")
-    parser.add_argument("--model-path", default="generalization_eval_best/best_model.zip", help="模型路径")
-    parser.add_argument("--scenario", default="shift_tasks_only", help="要回放的场景名")
+    parser.add_argument("--model-path", default="generalization_eval_best_vel_punishment/best_model.zip", help="模型路径")
+    parser.add_argument("--scenario", default="hard_ood_layout", help="要回放的场景名")
     parser.add_argument("--gif-name", default="agent_trajectory.gif", help="输出 GIF 文件名")
     parser.add_argument("--fps", type=int, default=60, help="GIF 帧率")
     parser.add_argument("--observation-mode", choices=["absolute", "relative"], default=None, help="观测模式，不填时自动推断")

@@ -95,13 +95,13 @@ class LTLfGymEnv(gym.Env):
         # 奖励设置
         self.REWARD_GOAL = 200.0        # 提高最终奖励
         self.REWARD_TRANSITION = 50.0   # 提高阶段奖励
-        self.REWARD_COLLISION = -0.2    # (关键) 大幅降低碰撞惩罚，允许试错
+        self.REWARD_COLLISION = -1.0    # (关键) 大幅降低碰撞惩罚，允许试错
         self.REWARD_TIME_STEP = -0.1    # (关键) 加大时间惩罚，逼迫它动起来
         self.POTENTIAL_SCALE = 2.0      # (关键) 加大势能引力   
         self.REWARD_STAGNATION = -0.5
         self.position_history = deque(maxlen=60)
         self.stagnation_std_threshold = 5.0
-        self.front_wall_threshold = 0.12
+        self.front_wall_threshold = 0.25
 
         if self.render_mode == "human":
             pygame.init()
@@ -227,22 +227,37 @@ class LTLfGymEnv(gym.Env):
         vy = action[1] * self.robot_vmax
         
         step_reward = self.REWARD_TIME_STEP
+        
+        # 1. 记录初始安全位置
         old_x, old_y = self.rx, self.ry
-
-        self.rx += vx * self.dt
-        self.ry += vy * self.dt
-
         collided = False
-        if self.rx < self.robot_radius or self.rx > WIDTH - self.robot_radius:
-            self.rx, collided = old_x, True
-        if self.ry < self.robot_radius or self.ry > HEIGHT - self.robot_radius:
-            self.ry, collided = old_y, True
+        BOUNCE_COEF = 0.8  # 物理反弹系数（0.0为死锁停滞，1.0为完全弹性反弹）
 
-        for obs in self.obstacles:
-            if obs.is_colliding_with_circle(self.rx, self.ry, self.robot_radius):
-                self.rx, self.ry = old_x, old_y
-                collided = True
-                break
+        # 2. 仅更新 X 轴并检测碰撞
+        self.rx += vx * self.dt
+        if self.rx < self.robot_radius or self.rx > WIDTH - self.robot_radius:
+            # 触发边界反弹：退回到安全位置，并向反方向弹开
+            self.rx = old_x - vx * self.dt * BOUNCE_COEF
+            collided = True
+        else:
+            for obs in self.obstacles:
+                if obs.is_colliding_with_circle(self.rx, self.ry, self.robot_radius):
+                    # 触发障碍物反弹
+                    self.rx = old_x - vx * self.dt * BOUNCE_COEF
+                    collided = True
+                    break
+
+        # 3. 仅更新 Y 轴并检测碰撞
+        self.ry += vy * self.dt
+        if self.ry < self.robot_radius or self.ry > HEIGHT - self.robot_radius:
+            self.ry = old_y - vy * self.dt * BOUNCE_COEF
+            collided = True
+        else:
+            for obs in self.obstacles:
+                if obs.is_colliding_with_circle(self.rx, self.ry, self.robot_radius):
+                    self.ry = old_y - vy * self.dt * BOUNCE_COEF
+                    collided = True
+                    break
 
         self.position_history.append((self.rx, self.ry))
         lidar_distances = self._get_lidar_data()
@@ -250,6 +265,23 @@ class LTLfGymEnv(gym.Env):
         front_min_lidar = self._front_sector_min_distance(lidar_distances, vx, vy)
         front_blocked = self._front_sector_blocked(lidar_distances, vx, vy)
         
+        # 计算基于速度向量投影的动态惩罚
+        DANGER_ZONE = 0.15
+        VELOCITY_PENALTY_SCALE = 0.005
+        danger_penalty = 0.0
+        num_rays = len(lidar_distances)
+        for i, dist in enumerate(lidar_distances):
+            if dist < DANGER_ZONE:
+                angle = i * (2 * math.pi / num_rays)
+                ray_dx = math.cos(angle)
+                ray_dy = math.sin(angle)
+                v_proj = vx * ray_dx + vy * ray_dy
+                if v_proj > 0:
+                    penalty = (DANGER_ZONE - dist) * v_proj * VELOCITY_PENALTY_SCALE
+                    danger_penalty += penalty
+                    
+        step_reward -= danger_penalty
+
         self.last_collision = float(collided)
         if collided:
             step_reward += self.REWARD_COLLISION

@@ -211,7 +211,7 @@ def main():
         verbose=1,
         learning_rate=3e-4,
         n_steps=2048,
-        batch_size=256,
+        batch_size=512,
         gamma=0.99,
         gae_lambda=0.95,
         ent_coef=0.01,
@@ -221,17 +221,33 @@ def main():
 
     eval_callback = EvalCallback(
         eval_env,
-        best_model_save_path="./generalization_eval_best/",
-        log_path="./generalization_eval_logs/",
+        best_model_save_path="./generalization_eval_best_vel_punishment/",
+        log_path="./generalization_eval__vel_punishment_logs/",
         eval_freq=25_000,
         deterministic=True,
         render=False,
     )
 
-    model.learn(total_timesteps=total_timesteps, progress_bar=True, callback=eval_callback)
-    model.save("ppo_ltlf_agent_generalization_v2_relative")
-    vec_env.close()
-    eval_env.close()
+    # 将学习过程放入 try-except 块中
+    try:
+        print("开始训练... (按 Ctrl+C 可安全中断并保存当前进度)")
+        model.learn(total_timesteps=total_timesteps, progress_bar=True, callback=eval_callback)
+    except KeyboardInterrupt:
+        # 捕获 Ctrl+C 中断信号
+        print("\n[警告] 训练被手动中断！正在保存当前最新模型...")
+    except Exception as e:
+        # 捕获其他未知报错
+        print(f"\n[错误] 训练发生异常崩溃: {e}")
+        print("正在尝试抢救保存当前最新模型...")
+    finally:
+        # 无论正常结束、被中断还是报错，这里的代码都一定会执行！
+        save_path = "ppo_ltlf_agent_generalization_v2_relative_latest"
+        model.save(save_path)
+        print(f"最新模型已安全保存至: {save_path}.zip")
+        
+        # 必须显式关闭环境，释放内存和线程
+        vec_env.close()
+        eval_env.close()
 
 
 if __name__ == "__main__":

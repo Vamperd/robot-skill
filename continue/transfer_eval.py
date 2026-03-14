@@ -216,7 +216,7 @@ def evaluate(model_path, render_first=False, observation_mode=None, n_stack=None
 
 def main():
     parser = argparse.ArgumentParser(description="评估 PPO 模型在新障碍/目标布局下的迁移能力")
-    parser.add_argument("--model-path", default="generalization_eval_best/best_model.zip", help="已训练模型路径")
+    parser.add_argument("--model-path", default="generalization_eval_best_vel_punishment/best_model.zip", help="已训练模型路径")
     parser.add_argument("--observation-mode", choices=["absolute", "relative"], default=None, help="评估时使用的观测模式；不填时自动根据模型推断")
     parser.add_argument("--n-stack", type=int, default=None, help="Frame stack 数量；不填时自动根据模型推断")
     parser.add_argument("--render-first", action="store_true", help="渲染第一个测试场景")
