@@ -78,10 +78,10 @@ class Robot:
         self.task_idx = 0
         
         self.planner = AStarPlanner(width=WIDTH, height=HEIGHT, resolution=10, robot_radius=self.robot_radius, margin=5)
-        self.stacker = FrameStacker(shape_1d=22, n_stack=4)
+        self.stacker = FrameStacker(shape_1d=27, n_stack=4)
         
         # 初始第一帧占位
-        self.stacker.reset(np.zeros(22, dtype=np.float32))
+        self.stacker.reset(np.zeros(27, dtype=np.float32))
         
         self.global_path = []
         self.lookahead_wp = (self.rx, self.ry)
@@ -191,7 +191,15 @@ class Robot:
         front_blocked = float(self._front_sector_blocked(lidar_obs, dir_x, dir_y))
         last_collision = float(self.last_collision)
         
-        obs_1d = [dir_x, dir_y, distance_norm] + lidar_obs + [is_stagnant, front_blocked, last_collision]
+        # 伪造老模型需要的缺失维度
+        remaining_time = 0.5  # 伪装一直处于中期
+        dfa_one_hot = [1.0, 0.0, 0.0, 0.0]  # 伪装处于初始任务状态
+        
+        # 严格按照老模型 27 维的观测顺序拼接：
+        # 基础(5维) + DFA(4维) + 雷达(16维) + 停滞与遮挡(2维)
+        base_obs = [dir_x, dir_y, distance_norm, last_collision, remaining_time]
+        obs_1d = base_obs + dfa_one_hot + lidar_obs + [is_stagnant, front_blocked]
+        
         return self.stacker.append(np.array(obs_1d, dtype=np.float32))
 
     def step_physics(self, action, other_robots):
@@ -277,7 +285,7 @@ def render_scene(screen, font, robots):
             pygame.draw.circle(screen, WHITE, (int(robot.rx), int(robot.ry)), 2)
 
 def main():
-    model_path = "导航结合RL运动/results/local_eval_best/best_model.zip"
+    model_path = "无导航纯RL底层运动器/results/generalization_eval_best_vel_punishment_狭窄距离，效果最好，可过U形弯/best_model.zip"
     if not os.path.exists(model_path):
         model_path = "ppo_local_planner.zip"
     
