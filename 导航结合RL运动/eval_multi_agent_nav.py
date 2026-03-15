@@ -308,6 +308,12 @@ def main():
         Robot("BlueBot", HARD_TASKS["Task D"], BLUE, LIGHT_BLUE, ["Task C", "Task A"]),
         Robot("PurpleBot", HARD_TASKS["Task C"], PURPLE, LIGHT_PURPLE, ["Task A", "Task D"])
     ]
+    
+    # 【核心性能修复：错峰规划】
+    # 将第一辆车的计时器拉满，立刻在第 1 帧触发规划
+    robots[0].steps_since_replan = 15 
+    # 将第二辆车的计时器错开，在第 8 帧触发规划，彻底避免同帧双 A* 计算
+    robots[1].steps_since_replan = 7
 
     running = True
     frames = []
@@ -343,7 +349,7 @@ def main():
                     continue
 
             robot.steps_since_replan += 1
-            if robot.steps_since_replan > 15:
+            if robot.steps_since_replan > 5:
                 robot.global_path = robot.planner.plan((robot.rx, robot.ry), target_pos, [(obs.x, obs.y, obs.w, obs.h) for obs in HARD_OBSTACLES])
                 robot.steps_since_replan = 0
             
