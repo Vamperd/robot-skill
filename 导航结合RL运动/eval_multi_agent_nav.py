@@ -91,6 +91,8 @@ class Robot:
         self.last_collision = False
         self.is_stuck = False
         self.last_lidar_dists = []
+        
+        self.last_action = np.array([0.0, 0.0], dtype=np.float32)
 
     def get_current_task_pos(self):
         if self.task_idx < len(self.task_sequence):
@@ -203,8 +205,18 @@ class Robot:
         return self.stacker.append(np.array(obs_1d, dtype=np.float32))
 
     def step_physics(self, action, other_robots):
-        vx = action[0] * self.robot_vmax
-        vy = action[1] * self.robot_vmax
+        # 1. EMA 低通滤波 (平滑动作，限制极大加速度，过滤高频抽搐)
+        alpha = 0.4  # 平滑系数：越小越平滑/惯性越大，1.0为完全不平滑
+        smoothed_action = alpha * np.array(action) + (1.0 - alpha) * self.last_action
+        self.last_action = smoothed_action
+
+        # 2. 动作死区 (Deadband)
+        # 如果网络输出的合力极小，说明处于平衡挣扎态，直接强制锁死刹车
+        if np.linalg.norm(smoothed_action) < 0.15:
+            smoothed_action = np.array([0.0, 0.0])
+
+        vx = smoothed_action[0] * self.robot_vmax
+        vy = smoothed_action[1] * self.robot_vmax
         
         old_x, old_y = self.rx, self.ry
         self.last_collision = False
