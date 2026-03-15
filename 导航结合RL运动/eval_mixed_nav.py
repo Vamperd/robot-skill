@@ -291,7 +291,7 @@ class MixedNavEnv:
 
 
 def main():
-    model_path = "ppo_local_planner.zip"
+    model_path = "导航结合RL运动/results/local_eval_best/best_model.zip"
     if not os.path.exists(model_path):
         print(f"找不到模型文件 {model_path}！请先运行 train_local_rl.py")
         # 允许没有模型但渲染出 A* 以供查错
@@ -344,7 +344,7 @@ def main():
         steps_since_replan += 1
         
         # 动态调整 A* 引导：发现卡住时降级引导距离！
-        current_lookahead = 25.0 if getattr(env, 'is_stuck', False) else 80.0
+        current_lookahead = 25.0 if getattr(env, 'is_stuck', False) else 60.0
         lookahead_wp = get_lookahead_waypoint((env.rx, env.ry), global_path, lookahead_dist=current_lookahead)
 
         # 构建底层特征输入并预测
