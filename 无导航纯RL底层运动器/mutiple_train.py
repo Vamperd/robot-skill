@@ -95,9 +95,9 @@ class LTLfGymEnv(gym.Env):
         # 奖励设置
         self.REWARD_GOAL = 200.0        # 提高最终奖励
         self.REWARD_TRANSITION = 50.0   # 提高阶段奖励
-        self.REWARD_COLLISION = -1.0    # (关键) 大幅降低碰撞惩罚，允许试错
+        self.REWARD_COLLISION = -10.0    # (关键) 大幅降低碰撞惩罚，允许试错
         self.REWARD_TIME_STEP = -0.1    # (关键) 加大时间惩罚，逼迫它动起来
-        self.POTENTIAL_SCALE = 2.0      # (关键) 加大势能引力   
+        self.POTENTIAL_SCALE = 1.0      # (关键) 加大势能引力   
         self.REWARD_STAGNATION = -0.5
         self.position_history = deque(maxlen=60)
         self.stagnation_std_threshold = 5.0
@@ -277,7 +277,8 @@ class LTLfGymEnv(gym.Env):
                 ray_dy = math.sin(angle)
                 v_proj = vx * ray_dx + vy * ray_dy
                 if v_proj > 0:
-                    penalty = (DANGER_ZONE - dist) * v_proj * VELOCITY_PENALTY_SCALE
+                    # 引入平方项，越靠近墙斥力呈指数级暴增，引导小车寻找正中心平衡点
+                    penalty = ((DANGER_ZONE - dist) / DANGER_ZONE) ** 2 * v_proj * VELOCITY_PENALTY_SCALE
                     danger_penalty += penalty
                     
         step_reward -= danger_penalty

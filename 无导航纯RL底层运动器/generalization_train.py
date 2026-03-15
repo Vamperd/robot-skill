@@ -5,7 +5,7 @@ import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor
-from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.callbacks import EvalCallback, BaseCallback, CallbackList
 
 from mutiple_train import HEIGHT, WIDTH, LTLfGymEnv, Obstacle, TaskPoint
 
@@ -39,6 +39,12 @@ LAYOUT_LIBRARY = [
         "obstacles": [(150, 120, 80, 320), (320, 260, 240, 60), (620, 120, 50, 260)],
         "tasks": {"Task A": (120, 520), "Task B": (520, 90), "Task C": (720, 520)},
         "start": (85.0, 85.0),
+    },
+    {
+        # 创造一个横向的极窄缝隙通道
+        "obstacles": [(200, 0, 400, 250), (200, 350, 400, 250)], 
+        "tasks": {"Task A": (100, 300), "Task B": (700, 300), "Task C": (100, 100)},
+        "start": (100.0, 300.0),
     },
 ]
 
@@ -205,6 +211,23 @@ def main():
     eval_env = DummyVecEnv([make_eval_env()])
     eval_env = VecFrameStack(eval_env, n_stack=4)
 
+    class EntropyDecayCallback(BaseCallback):
+        def __init__(self, initial_ent_coef=0.03, final_ent_coef=0.0001, total_timesteps=1_500_000, verbose=0):
+            super().__init__(verbose)
+            self.initial_ent_coef = initial_ent_coef
+            self.final_ent_coef = final_ent_coef
+            self.total_timesteps = total_timesteps
+
+        def _on_step(self) -> bool:
+            # 根据当前步数计算进度比例
+            progress = min(1.0, self.num_timesteps / self.total_timesteps)
+            current_ent_coef = self.initial_ent_coef - progress * (self.initial_ent_coef - self.final_ent_coef)
+            # 动态修改模型的熵系数
+            self.model.ent_coef = current_ent_coef
+            # 写入 Tensorboard
+            self.logger.record("config/ent_coef", current_ent_coef)
+            return True
+
     model = PPO(
         "MlpPolicy",
         vec_env,
@@ -214,7 +237,7 @@ def main():
         batch_size=512,
         gamma=0.99,
         gae_lambda=0.95,
-        ent_coef=0.01,
+        ent_coef=0.03, # 初始熵系数通过传入 float 兼容 SB3
         policy_kwargs=dict(net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128])),
         tensorboard_log="./ppo_ltlf_tensorboard_generalization_v2/",
     )
@@ -227,11 +250,15 @@ def main():
         deterministic=True,
         render=False,
     )
+    
+    # 组合 Callback
+    ent_decay_callback = EntropyDecayCallback(initial_ent_coef=0.03, final_ent_coef=0.0001, total_timesteps=total_timesteps)
+    callback_list = CallbackList([eval_callback, ent_decay_callback])
 
     # 将学习过程放入 try-except 块中
     try:
         print("开始训练... (按 Ctrl+C 可安全中断并保存当前进度)")
-        model.learn(total_timesteps=total_timesteps, progress_bar=True, callback=eval_callback)
+        model.learn(total_timesteps=total_timesteps, progress_bar=True, callback=callback_list)
     except KeyboardInterrupt:
         # 捕获 Ctrl+C 中断信号
         print("\n[警告] 训练被手动中断！正在保存当前最新模型...")

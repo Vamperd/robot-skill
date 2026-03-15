@@ -1,0 +1,52 @@
+{
+  "model_path": "generalization_eval_best_vel_punishment/best_model.zip",
+  "observation_mode": "relative",
+  "n_stack": 4,
+  "success_rate": 1.0,
+  "avg_reward": 1476.2476726879056,
+  "avg_final_dfa_state": 3.0,
+  "results": [
+    {
+      "success": true,
+      "steps": 338,
+      "total_reward": 1539.278517626226,
+      "final_dfa_state": 3,
+      "scenario": "baseline_train_layout"
+    },
+    {
+      "success": true,
+      "steps": 287,
+      "total_reward": 1364.5112949814647,
+      "final_dfa_state": 3,
+      "scenario": "shift_tasks_only"
+    },
+    {
+      "success": true,
+      "steps": 318,
+      "total_reward": 1550.920590378344,
+      "final_dfa_state": 3,
+      "scenario": "shift_obstacles_only"
+    },
+    {
+      "success": true,
+      "steps": 310,
+      "total_reward": 1425.1871669888496,
+      "final_dfa_state": 3,
+      "scenario": "shift_both_layout"
+    },
+    {
+      "success": true,
+      "steps": 371,
+      "total_reward": 1637.0631536617875,
+      "final_dfa_state": 3,
+      "scenario": "hard_ood_layout"
+    },
+    {
+      "success": true,
+      "steps": 286,
+      "total_reward": 1340.5253124907613,
+      "final_dfa_state": 3,
+      "scenario": "hard_very_thin_corridor_layout"
+    }
+  ]
+}
