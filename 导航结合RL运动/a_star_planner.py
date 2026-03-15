@@ -10,6 +10,7 @@ class AStarPlanner:
         self.margin = margin
         self.cols = int(width / resolution)
         self.rows = int(height / resolution)
+        self.grid_blocked = None  # 缓存静态障碍物网格
 
     def _rect_distance(self, cx, cy, rect):
         rx, ry, rw, rh = rect
@@ -26,17 +27,18 @@ class AStarPlanner:
         if (start_c, start_r) == (end_c, end_r):
             return [end_pos]
 
-        # 障碍物网格预计算
-        grid_blocked = [[False for _ in range(self.rows)] for _ in range(self.cols)]
-        safe_dist = self.robot_radius + self.margin
-        for c in range(self.cols):
-            cx = c * self.resolution + self.resolution / 2.0
-            for r in range(self.rows):
-                cy = r * self.resolution + self.resolution / 2.0
-                for obs in obstacles:
-                    if self._rect_distance(cx, cy, obs) < safe_dist:
-                        grid_blocked[c][r] = True
-                        break
+        # 障碍物网格预计算 (添加缓存机制，仅计算一次)
+        if self.grid_blocked is None:
+            self.grid_blocked = [[False for _ in range(self.rows)] for _ in range(self.cols)]
+            safe_dist = self.robot_radius + self.margin
+            for c in range(self.cols):
+                cx = c * self.resolution + self.resolution / 2.0
+                for r in range(self.rows):
+                    cy = r * self.resolution + self.resolution / 2.0
+                    for obs in obstacles:
+                        if self._rect_distance(cx, cy, obs) < safe_dist:
+                            self.grid_blocked[c][r] = True
+                            break
 
         # A* 搜索
         open_set = []
@@ -64,7 +66,7 @@ class AStarPlanner:
             for dc, dr, cost in motions:
                 nc, nr = current[0] + dc, current[1] + dr
 
-                if 0 <= nc < self.cols and 0 <= nr < self.rows and not grid_blocked[nc][nr]:
+                if 0 <= nc < self.cols and 0 <= nr < self.rows and not self.grid_blocked[nc][nr]:
                     tentative_g_score = g_score[current] + cost
                     
                     if tentative_g_score < g_score.get((nc, nr), float('inf')):
