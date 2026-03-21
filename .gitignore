@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
-offline_maps
+offline_maps_v2
+plan.md
+improve.md
