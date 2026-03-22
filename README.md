@@ -1,23 +1,33 @@
 # robot-skill
 
-这是一个分层机器人控制与协同调度实验仓库，当前主要包含三条主线：
+这是一个分层多机器人任务执行实验仓库，当前主线已经从“底层连续运动控制”扩展到“高层调度 + A* 导航 + 底层 PPO 控制”的完整链路。
 
-- [无导航纯RL底层运动器](c:/Users/86136/Desktop/code/RL/robot-skill/无导航纯RL底层运动器/README.md)：训练底层连续运动 RL 控制器
-- `导航结合RL运动/`：A* 全局导航 + PPO 底层避障的混合导航验证
-- `协同调度/`：高层多机器人任务分配与协同调度
+目前仓库主要包含三部分：
 
-本次更新的重点是把 `协同调度` 从“演示型随机地图 + 写死任务序列”升级成“可训练高层调度器”的 v2 数据与环境体系。
+- `无导航纯RL底层运动器/`：训练单机器人底层连续运动控制器
+- `导航结合RL运动/`：A* 全局导航 + 局部 PPO 避障 + 多机器人联调
+- `协同调度/`：高层任务分配、协同任务推进、顺序调度训练与评估
+
+当前推荐主流程是：
+
+1. 生成 `offline_maps_v2` 数据集
+2. 用基线验证数据与环境
+3. 用行为克隆预热高层 attention 调度器
+4. 用自定义 masked PPO 微调高层调度器
+5. 在 `test` / `stress` 上评估
+6. 接入 A* 与底层 PPO，做可视化联调和 GIF 导出
 
 ## 本次更新了什么
 
-### 1. 新版协同调度数据集 schema
+### 1. v2 场景数据集
 
 核心文件：
 
-- [scenario_generator.py](c:/Users/86136/Desktop/code/RL/robot-skill/协同调度/scenario_generator.py)
-- [build_offline_maps.py](c:/Users/86136/Desktop/code/RL/robot-skill/协同调度/build_offline_maps.py)
+- `协同调度/scenario_generator.py`
+- `协同调度/build_offline_maps.py`
+- `协同调度/view_offline_maps.py`
 
-现在生成的是 `offline_maps_v2` 风格的场景，不再为每个机器人提前写死 `task_sequence`。  
+现在主训练数据使用 `offline_maps_v2`，不再为每个机器人预写 `task_sequence`。  
 每个场景包含：
 
 - `schema_version`
@@ -30,94 +40,126 @@
 - `distance_matrix`
 - `difficulty_meta`
 
-也就是说，高层调度训练时拿到的是“机器人池 + 任务池 + 约束 + ETA”，而不是现成答案。
+训练时输入的是“机器人池 + 任务池 + 约束 + 路径预计耗时”，而不是固定答案。
 
-### 2. 场景分布从纯随机改成分族模板
+### 2. 六类 family 场景
 
 当前固定 6 个 family：
 
-- `open_balance`：开阔低冲突场景
-- `role_mismatch`：最近机器人与任务角色需求不匹配
-- `single_bottleneck`：单瓶颈拥堵
-- `double_bottleneck`：双瓶颈交叉冲突
-- `far_near_trap`：近任务诱惑与远任务先做的权衡
-- `multi_sync_cluster`：多协同任务密集竞争
+- `open_balance`
+- `role_mismatch`
+- `single_bottleneck`
+- `double_bottleneck`
+- `far_near_trap`
+- `multi_sync_cluster`
 
-这样可以让训练集明确覆盖角色约束、拥堵、等待、冲突和协同资源竞争。
+默认会按 `train / val / test / stress` 四个 split 生成。
 
-### 3. 可达性校验升级
-
-旧版只粗略判断“路径是不是太短”，新版改成了 **A* 终点精确可达检查**：
-
-- 路径最后一点必须真正到达目标
-- 隐藏死区与伪可达场景会被直接拒绝
-- 同时记录 `component_count`、`route_overlap_score` 等难度元数据
-
-### 4. 新增事件驱动调度环境
+### 3. 统一任务推进逻辑
 
 核心文件：
 
-- [scheduling_env.py](c:/Users/86136/Desktop/code/RL/robot-skill/协同调度/scheduling_env.py)
+- `协同调度/task_runtime.py`
 
-这个环境是为高层 RL 准备的，不直接做 Pygame 连续物理，而是做事件驱动调度：
+当前规则：
 
-- 决策时机：机器人空闲、任务完成、等待超时、阻塞超时
-- 动作：给空闲机器人分配 `task_id` 或 `wait`
-- 状态：
-  - `robots`
-  - `tasks`
-  - `robot_task_eta`
-  - `task_task_eta`
-  - `action_mask`
-- 奖励：
-  - 任务完成奖励
-  - 时间惩罚
-  - 空转惩罚
-  - 等待惩罚
-  - 非法动作惩罚
-
-### 5. 协同任务完成逻辑统一抽离
-
-核心文件：
-
-- [task_runtime.py](c:/Users/86136/Desktop/code/RL/robot-skill/协同调度/task_runtime.py)
-
-现在统一采用以下规则：
-
-- 单任务：进入服务区后累计进度，离开后暂停，不重置
-- 协同任务：只有现场机器人集合满足 `required_roles` 时，才推进共享进度
+- 单任务进入服务区后累计进度，离开后暂停，不重置
+- 协同任务只有满足 `required_roles` 时才推进共享进度
 - 错误角色不计入有效联盟
-- 多余机器人不会阻塞任务完成
+- 多余机器人不会阻塞完成
+- 任务链约束统一使用 `tasks[*].precedence`
 
-### 6. 现有极端导航评估脚本已接入统一任务逻辑
-
-已更新：
-
-- [eval_multi_agent_nav_extreme.py](c:/Users/86136/Desktop/code/RL/robot-skill/导航结合RL运动/eval_multi_agent_nav_extreme.py)
-
-它现在不再使用旧版的“同名任务机器人都刷各自进度”的简化逻辑，而是复用统一 runtime。这样后续高层调度训练和最终导航联调时，任务推进语义是一致的。
-
-### 7. 新增 3 个基线策略
+### 4. 事件驱动高层环境
 
 核心文件：
 
-- [baselines.py](c:/Users/86136/Desktop/code/RL/robot-skill/协同调度/baselines.py)
+- `协同调度/scheduling_env.py`
 
-当前包含：
+这是联合动作版本的高层调度环境，适合做基线和回归验证。  
+观测中主要包含：
+
+- `robots`
+- `tasks`
+- `robot_task_eta`
+- `task_task_eta`
+- `action_mask`
+
+### 5. HeteroMRTA 风格顺序调度环境
+
+核心文件：
+
+- `协同调度/sequential_scheduling_env.py`
+- `协同调度/scheduler_utils.py`
+
+这是当前高层训练真正使用的环境封装。  
+它会把一个事件点上的“多个空闲机器人同时待分配”，改造成“逐机器人顺序决策”的形式，更适合 attention pointer policy。
+
+顺序环境额外提供：
+
+- `current_robot`
+- `current_action_mask`
+- `pending_assignment_mask`
+- `remaining_role_deficit`
+- `precedence_state`
+
+### 6. 高层 attention 调度器与训练脚本
+
+核心文件：
+
+- `协同调度/attention_policy.py`
+- `协同调度/scheduler_training_utils.py`
+- `协同调度/train_scheduler_bc.py`
+- `协同调度/train_scheduler_rl.py`
+- `协同调度/evaluate_scheduler.py`
+- `协同调度/render_scheduler_episode.py`
+
+高层模型不是用 SB3 训练，而是自定义 PyTorch 训练器：
+
+- 第一阶段：`role_aware_greedy` 专家轨迹行为克隆预热
+- 第二阶段：自定义 masked PPO 风格微调
+
+### 7. 低层模型统一适配与正式联调入口
+
+核心文件：
+
+- `导航结合RL运动/low_level_policy_adapter.py`
+- `导航结合RL运动/scheduler_nav_runner.py`
+- `导航结合RL运动/run_scheduled_nav.py`
+
+当前正式联调入口已经变成 `run_scheduled_nav.py`。  
+它会把：
+
+- 高层 scheduler
+- A* 全局路径
+- 局部 waypoint
+- 底层 PPO 模型
+- 统一任务 runtime
+
+串成完整的多机器人执行链路。
+
+`low_level_policy_adapter.py` 会自动兼容两种底层模型输入：
+
+- `22 x 4` 的局部导航模型
+- `27 x 4` 的相对观测底层运动模型
+
+### 8. 基线与参考脚本
+
+基线文件：
+
+- `协同调度/baselines.py`
+
+当前可直接比较的基线：
 
 - `random`
 - `nearest_eta_greedy`
 - `role_aware_greedy`
 
-它们可以直接用于 `val/test` 上做基础对比，检查高层调度环境是否合理。
+注意：
 
-### 8. 说明文档补充
+- `导航结合RL运动/eval_multi_agent_nav.py`
+- `导航结合RL运动/eval_multi_agent_nav_extreme.py`
 
-我补充了：
-
-- [improve.md](c:/Users/86136/Desktop/code/RL/robot-skill/improve.md)
-
-如果你想快速看这次改造的摘要，也可以先读这个文件。
+现在更适合作为历史参考脚本或回归脚本，不再是正式主入口。
 
 ## 目录说明
 
@@ -130,20 +172,46 @@ robot-skill/
 ├── 导航结合RL运动/
 │   ├── a_star_planner.py
 │   ├── local_rl_env.py
-│   ├── eval_multi_agent_nav.py
-│   └── eval_multi_agent_nav_extreme.py
+│   ├── low_level_policy_adapter.py
+│   ├── scheduler_nav_runner.py
+│   └── run_scheduled_nav.py
 └── 协同调度/
     ├── scenario_generator.py
     ├── build_offline_maps.py
     ├── view_offline_maps.py
     ├── task_runtime.py
     ├── scheduling_env.py
+    ├── sequential_scheduling_env.py
+    ├── attention_policy.py
+    ├── scheduler_training_utils.py
+    ├── train_scheduler_bc.py
+    ├── train_scheduler_rl.py
+    ├── evaluate_scheduler.py
+    ├── render_scheduler_episode.py
     └── baselines.py
 ```
 
-## 具体应该如何使用
+## 安装依赖
 
-### 1. 生成新版协同调度数据集
+### 只跑高层调度数据、基线、BC、RL 训练
+
+```bash
+pip install numpy torch pygame imageio
+```
+
+### 跑完整导航联调
+
+```bash
+pip install numpy torch pygame imageio gymnasium stable-baselines3
+```
+
+如果你要继续使用旧的底层训练脚本，还需要参考：
+
+- `无导航纯RL底层运动器/README.md`
+
+## 完整训练流程
+
+### 第 1 步：生成 v2 数据集
 
 正式生成：
 
@@ -151,23 +219,26 @@ robot-skill/
 python 协同调度/build_offline_maps.py --save-dir offline_maps_v2 --overwrite
 ```
 
-说明：
-
-- 默认会按 `train / val / test / stress` 生成
-- 每个 split 下再按 6 个 family 分目录存放
-- 会额外输出一个 `dataset_manifest.json`，记录数据集摘要
-
-调试时建议先生成小样本：
+调试生成小样本：
 
 ```bash
 python 协同调度/build_offline_maps.py --save-dir tmp_offline_maps_v2 --overwrite --limit-per-family 1
 ```
 
-这样会每个 family 只生成 1 张图，方便快速检查流程。
+生成后目录会按下面方式组织：
 
-### 2. 查看生成出的场景
+- `offline_maps_v2/train/...`
+- `offline_maps_v2/val/...`
+- `offline_maps_v2/test/...`
+- `offline_maps_v2/stress/...`
 
-随机查看 `train`：
+并自动生成：
+
+- `offline_maps_v2/dataset_manifest.json`
+
+### 第 2 步：查看和抽查场景
+
+随机查看训练集：
 
 ```bash
 python 协同调度/view_offline_maps.py --cache-dir offline_maps_v2 --split train
@@ -179,27 +250,25 @@ python 协同调度/view_offline_maps.py --cache-dir offline_maps_v2 --split tra
 python 协同调度/view_offline_maps.py --cache-dir offline_maps_v2 --split val --family single_bottleneck
 ```
 
-如果只想打开一次预览窗口：
+只弹一次窗口：
 
 ```bash
 python 协同调度/view_offline_maps.py --cache-dir offline_maps_v2 --split val --family role_mismatch --single-shot
 ```
 
-### 3. 跑基线评估
-
-在验证集上跑 3 个基线：
+### 第 3 步：先跑基线，确认环境合理
 
 ```bash
 python 协同调度/baselines.py --scenario-dir offline_maps_v2 --split val
 ```
 
-调试时限制回合数：
+调试时可限制回合数：
 
 ```bash
 python 协同调度/baselines.py --scenario-dir tmp_offline_maps_v2 --split val --max-episodes 2
 ```
 
-输出指标包括：
+基线输出指标包括：
 
 - `success_rate`
 - `mean_makespan`
@@ -208,9 +277,181 @@ python 协同调度/baselines.py --scenario-dir tmp_offline_maps_v2 --split val 
 - `mean_idle_ratio`
 - `mean_deadlock_events`
 
-### 4. 在代码里直接使用场景生成与加载接口
+### 第 4 步：行为克隆预热高层 scheduler
 
-场景接口在 [scenario_generator.py](c:/Users/86136/Desktop/code/RL/robot-skill/协同调度/scenario_generator.py) 里：
+这一步会使用 `role_aware_greedy` 在顺序调度环境上采专家轨迹，然后训练 attention scheduler。
+
+标准命令：
+
+```bash
+python 协同调度/train_scheduler_bc.py --scenario-dir offline_maps_v2 --train-split train --val-split val
+```
+
+常用参数：
+
+- `--epochs`
+- `--batch-size`
+- `--lr`
+- `--limit-train-per-family`
+- `--limit-val-per-family`
+- `--save-dir`
+- `--device`
+
+默认保存目录：
+
+- `协同调度/checkpoints_bc/`
+
+关键输出文件：
+
+- `协同调度/checkpoints_bc/latest_scheduler_bc.pt`
+- `协同调度/checkpoints_bc/best_scheduler_bc.pt`
+
+小样本烟测示例：
+
+```bash
+python 协同调度/train_scheduler_bc.py --scenario-dir offline_maps_v2 --train-split train --val-split val --epochs 1 --limit-train-per-family 1 --limit-val-per-family 1 --batch-size 32 --save-dir tmp_scheduler_bc_smoke --device cpu
+```
+
+### 第 5 步：masked PPO 微调高层 scheduler
+
+这一步会从 BC checkpoint 或随机初始化出发，用自定义 actor-critic / PPO 风格更新继续优化高层调度器。
+
+标准命令：
+
+```bash
+python 协同调度/train_scheduler_rl.py --scenario-dir offline_maps_v2 --init-model 协同调度/checkpoints_bc/best_scheduler_bc.pt
+```
+
+常用参数：
+
+- `--total-updates`
+- `--rollout-steps`
+- `--ppo-epochs`
+- `--batch-size`
+- `--eval-every`
+- `--limit-train-per-family`
+- `--limit-val-per-family`
+- `--save-dir`
+- `--device`
+
+默认保存目录：
+
+- `协同调度/checkpoints_rl/`
+
+关键输出文件：
+
+- `协同调度/checkpoints_rl/latest_scheduler_rl.pt`
+- `协同调度/checkpoints_rl/best_scheduler_rl.pt`
+
+小样本烟测示例：
+
+```bash
+python 协同调度/train_scheduler_rl.py --scenario-dir offline_maps_v2 --train-split train --val-split val --total-updates 1 --rollout-steps 64 --ppo-epochs 1 --batch-size 16 --limit-train-per-family 1 --limit-val-per-family 1 --save-dir tmp_scheduler_rl_smoke --init-model tmp_scheduler_bc_smoke/best_scheduler_bc.pt --device cpu
+```
+
+### 第 6 步：在验证集或测试集评估模型
+
+标准评估：
+
+```bash
+python 协同调度/evaluate_scheduler.py --model 协同调度/checkpoints_rl/best_scheduler_rl.pt --split test
+```
+
+与基线一起比较：
+
+```bash
+python 协同调度/evaluate_scheduler.py --model 协同调度/checkpoints_rl/best_scheduler_rl.pt --split test --include-baselines
+```
+
+保存 JSON：
+
+```bash
+python 协同调度/evaluate_scheduler.py --model 协同调度/checkpoints_rl/best_scheduler_rl.pt --split test --include-baselines --save-json scheduler_test_metrics.json
+```
+
+调试时限制回合数：
+
+```bash
+python 协同调度/evaluate_scheduler.py --model 协同调度/checkpoints_rl/best_scheduler_rl.pt --scenario-dir offline_maps_v2 --split val --max-episodes 4
+```
+
+### 第 7 步：可视化高层调度事件
+
+只看高层事件，不运行底层连续物理：
+
+使用启发式策略：
+
+```bash
+python 协同调度/render_scheduler_episode.py --split val --family open_balance --policy role_aware_greedy
+```
+
+使用训练好的模型：
+
+```bash
+python 协同调度/render_scheduler_episode.py --split val --family open_balance --policy model --model 协同调度/checkpoints_rl/best_scheduler_rl.pt
+```
+
+导出 GIF：
+
+```bash
+python 协同调度/render_scheduler_episode.py --split val --family multi_sync_cluster --policy model --model 协同调度/checkpoints_rl/best_scheduler_rl.pt --gif-name scheduler_episode.gif
+```
+
+### 第 8 步：接入 A* 和底层 PPO 做完整联调
+
+这是当前正式的端到端联调入口。
+
+使用训练好的高层模型：
+
+```bash
+python 导航结合RL运动/run_scheduled_nav.py --scenario-dir offline_maps_v2 --split stress --limit 1 --scheduler-model 协同调度/checkpoints_rl/best_scheduler_rl.pt --low-level-model 无导航纯RL底层运动器/results/generalization_eval_best_vel_punishment_狭窄距离，效果最好，可过U形弯/best_model.zip --render --gif-name demo.gif
+```
+
+如果暂时没有高层模型，可以先用启发式调度：
+
+```bash
+python 导航结合RL运动/run_scheduled_nav.py --scenario-dir offline_maps_v2 --split stress --limit 1 --scheduler-policy role_aware_greedy --low-level-model 导航结合RL运动/results/local_eval_best/best_model.zip --render
+```
+
+直接指定单个场景：
+
+```bash
+python 导航结合RL运动/run_scheduled_nav.py --scenario-file offline_maps_v2/stress/open_balance/scenario_0000.pkl --scheduler-model 协同调度/checkpoints_rl/best_scheduler_rl.pt --low-level-model 导航结合RL运动/results/local_eval_best/best_model.zip --render
+```
+
+常用参数：
+
+- `--scenario-file`
+- `--scenario-dir`
+- `--split`
+- `--family`
+- `--limit`
+- `--scheduler-model`
+- `--scheduler-policy`
+- `--low-level-model`
+- `--render`
+- `--gif-name`
+- `--max-frames`
+
+## 训练与评估时如何使用 split
+
+- `train`：高层调度训练主数据
+- `val`：训练过程中选模型、调参数、看是否过拟合
+- `test`：模型定型后做正式结果报告
+- `stress`：极端场景压力测试，不建议参与训练或调参
+
+推荐顺序：
+
+1. 在 `train` 上做 BC + RL 训练
+2. 周期性在 `val` 上评估并保存最佳 checkpoint
+3. 用 `test` 做正式对比结果
+4. 用 `stress` 做泛化和极端场景联调回放
+
+## 代码中如何直接使用接口
+
+### 场景接口
+
+在 `协同调度/scenario_generator.py` 中可直接使用：
 
 - `generate_scenario(...)`
 - `load_random_scenario(...)`
@@ -218,15 +459,7 @@ python 协同调度/baselines.py --scenario-dir tmp_offline_maps_v2 --split val 
 - `summarize_scenario(...)`
 - `validate_scenario(...)`
 
-适合：
-
-- 训练前抽样检查
-- 评估脚本直接读取数据
-- 单场景分析
-
-### 5. 在代码里直接使用高层调度环境
-
-示例：
+### 联合动作调度环境
 
 ```python
 from scheduling_env import SchedulingEnv
@@ -237,50 +470,61 @@ action = env.action_space.sample()
 obs, reward, terminated, truncated, info = env.step(action)
 ```
 
-观测结构：
+### 顺序调度环境
 
-- `obs["robots"]`
-- `obs["tasks"]`
-- `obs["robot_task_eta"]`
-- `obs["task_task_eta"]`
-- `obs["action_mask"]`
+```python
+from sequential_scheduling_env import SequentialSchedulingEnv
 
-适合下一步直接接到高层 RL 训练脚本中。
-
-### 6. 用统一任务逻辑做最终导航联调
-
-如果你要验证“高层调度 + A* + 底层 PPO”的整套链路，可以使用：
-
-```bash
-python 导航结合RL运动/eval_multi_agent_nav_extreme.py
+env = SequentialSchedulingEnv(scenario_dir="offline_maps_v2", split="train")
+obs, info = env.reset()
+action = 0
+obs, reward, terminated, truncated, info = env.step(action)
 ```
 
-这个脚本现在已经接入统一的任务推进 runtime，协同任务会按照角色约束和共享进度来完成。
+### 底层模型适配器
+
+```python
+from low_level_policy_adapter import LowLevelPolicyAdapter
+
+adapter = LowLevelPolicyAdapter.from_model("导航结合RL运动/results/local_eval_best/best_model.zip")
+action = adapter.predict_action(
+    robot_state=robot_state,
+    waypoint=waypoint,
+    obstacles=obstacles,
+    neighbors=neighbors,
+)
+```
 
 ## 推荐工作流
 
-建议按下面顺序推进：
+推荐按下面顺序推进：
 
-1. 先生成一个小样本 `tmp_offline_maps_v2`
-2. 用 `view_offline_maps.py` 肉眼检查 6 类 family 是否符合预期
-3. 用 `baselines.py` 跑 `val`，确认指标和行为合理
-4. 再把 `SchedulingEnv` 接到高层 RL 训练脚本
-5. 高层策略训练完后，再接回 `eval_multi_agent_nav_extreme.py` 做联调
+1. 用 `build_offline_maps.py` 生成 `offline_maps_v2`
+2. 用 `view_offline_maps.py` 抽查 family 分布与地图可视化
+3. 用 `baselines.py` 在 `val` 上确认环境行为合理
+4. 跑 `train_scheduler_bc.py` 做专家预热
+5. 跑 `train_scheduler_rl.py` 做高层微调
+6. 跑 `evaluate_scheduler.py` 在 `val/test` 对比基线
+7. 跑 `render_scheduler_episode.py` 看高层任务链决策过程
+8. 跑 `run_scheduled_nav.py` 做“高层调度 + A* + 底层 PPO”的完整联调
+9. 在 `stress` 上导出 GIF 做最终展示
 
 ## 当前注意事项
 
-- 这台环境里没有安装 `gymnasium`，所以 `SchedulingEnv` 里做了轻量回退，方便先跑基线和调试。
-- 如果你接下来要用 Stable-Baselines3 训练高层 RL，建议先安装：
+- 高层 scheduler 训练是自定义 PyTorch 训练器，不是 SB3。
+- 完整导航联调需要 `stable-baselines3` 和 `gymnasium`。
+- 如果缺少 SB3，`low_level_policy_adapter.py` 会给出明确报错：
 
-```bash
-pip install gymnasium
+```text
+LowLevelPolicyAdapter 需要 stable-baselines3。请先执行: pip install stable-baselines3 gymnasium
 ```
 
-- 旧的 `offline_maps` 还保留着，但现在更适合作为回归样本或可视化样本，不建议继续作为主训练集。
-- `tmp_offline_maps_v2/` 是调试用的小样本目录，不是正式训练集。
+- `协同调度/checkpoints_bc/` 和 `协同调度/checkpoints_rl/` 默认会保存训练产物，当前已经写入 `.gitignore`。
+- `tmp_offline_maps_v2/`、`tmp_scheduler_bc_smoke/`、`tmp_scheduler_rl_smoke/` 更适合调试，不是正式训练目录。
+- 旧的 `offline_maps/` 更适合作为回归或展示样本，不建议继续作为主训练集。
+- 当前环境里可能会出现 PyTorch 与 NumPy 2.x 的兼容警告；若后续训练不稳定，建议使用匹配版本的 `torch` 与 `numpy`。
 
 ## 相关文档
 
-- 根目录说明：`README.md`
-- 协同调度改造摘要：[improve.md](c:/Users/86136/Desktop/code/RL/robot-skill/improve.md)
-- 底层运动器详细说明：[无导航纯RL底层运动器/README.md](c:/Users/86136/Desktop/code/RL/robot-skill/无导航纯RL底层运动器/README.md)
+- 根目录改造规划摘要：`improve.md`
+- 底层连续运动控制说明：`无导航纯RL底层运动器/README.md`
