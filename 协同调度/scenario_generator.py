@@ -11,6 +11,21 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import pygame
 
+try:
+    from coop_docking import (
+        DEFAULT_DOCKING_RADIUS,
+        DEFAULT_PLANNER_MARGIN,
+        DEFAULT_PLANNER_RESOLUTION,
+        generate_docking_slots,
+    )
+except ImportError:  # pragma: no cover - package import fallback
+    from .coop_docking import (
+        DEFAULT_DOCKING_RADIUS,
+        DEFAULT_PLANNER_MARGIN,
+        DEFAULT_PLANNER_RESOLUTION,
+        generate_docking_slots,
+    )
+
 
 RectLike = Tuple[int, int, int, int]
 PointLike = Tuple[int, int]
@@ -686,7 +701,7 @@ def _build_tasks(
             rng,
             blueprint.sync_task_zones,
             blueprint.obstacles,
-            ROBOT_RADIUS + 18,
+            ROBOT_RADIUS + int(DEFAULT_DOCKING_RADIUS) + int(DEFAULT_PLANNER_MARGIN),
             occupied,
             min_pair_dist=65.0,
         )
@@ -706,6 +721,30 @@ def _build_tasks(
 
     _apply_precedence(tasks, robots, family, rng, stress)
     return tasks
+
+
+def _validate_sync_docking_slots(
+    tasks: Sequence[Dict],
+    obstacles: Sequence[RectLike],
+) -> bool:
+    for task in tasks:
+        if task.get("kind") != "sync":
+            continue
+        slot_count = max(1, sum(task.get("required_roles", {}).values()))
+        slots = generate_docking_slots(
+            task_pos=task["pos"],
+            slot_count=slot_count,
+            obstacles=obstacles,
+            width=WIDTH,
+            height=HEIGHT,
+            robot_radius=ROBOT_RADIUS,
+            docking_radius=DEFAULT_DOCKING_RADIUS,
+            planner_margin=DEFAULT_PLANNER_MARGIN,
+            planner_resolution=DEFAULT_PLANNER_RESOLUTION,
+        )
+        if len(slots) < slot_count:
+            return False
+    return True
 
 
 def _build_distance_matrix(
@@ -779,6 +818,8 @@ def validate_scenario(scenario_config: Dict) -> bool:
     tasks = scenario_config.get("tasks", [])
     robots = scenario_config.get("robots", [])
     if not tasks or not robots:
+        return False
+    if not _validate_sync_docking_slots(tasks, scenario_config.get("obstacles", [])):
         return False
 
     result = _build_distance_matrix(
@@ -860,6 +901,9 @@ def generate_scenario(
             robots = _sample_robots(rng, family, blueprint, robot_count)
             tasks = _build_tasks(rng, family, robots, blueprint, total_tasks, sync_count, stress)
         except RuntimeError:
+            continue
+
+        if not _validate_sync_docking_slots(tasks, blueprint.obstacles):
             continue
 
         matrix_result = _build_distance_matrix(robots, tasks, blueprint.obstacles, blueprint.chokepoint_zones)

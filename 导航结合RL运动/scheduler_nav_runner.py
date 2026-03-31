@@ -4,7 +4,7 @@ import math
 import sys
 from collections import deque
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pygame
@@ -23,6 +23,13 @@ from scheduler_utils import (  # noqa: E402
     legal_action_mask_for_robot,
     role_aware_greedy_action_for_robot,
 )
+from coop_docking import (  # noqa: E402
+    DEFAULT_DOCKING_RADIUS,
+    DEFAULT_PLANNER_MARGIN,
+    DEFAULT_PLANNER_RESOLUTION,
+    DEFAULT_SLOT_CAPTURE_RADIUS,
+    generate_docking_slots,
+)
 from task_runtime import ContinuousTaskRuntime  # noqa: E402
 
 
@@ -34,6 +41,7 @@ BLUE = (80, 150, 255)
 RED = (255, 100, 100)
 GRAY = (150, 150, 150)
 ORANGE = (255, 160, 80)
+LIGHT_GRAY = (200, 200, 200)
 WIDTH = 800
 HEIGHT = 600
 MOTION_DT = 1.0 / 60.0
@@ -41,6 +49,9 @@ SIM_DT = 1.0
 DEFAULT_SERVICE_RADIUS = 40.0
 BASE_TRAVEL_SPEED = 4.0
 EPS = 1e-6
+DEFAULT_SYNC_DOCKING_RADIUS = DEFAULT_DOCKING_RADIUS
+DEFAULT_SLOT_CAPTURE_RADIUS_PIXELS = DEFAULT_SLOT_CAPTURE_RADIUS
+DEFAULT_FINAL_SNAP_RADIUS = 18.0
 
 
 class SchedulerNavRunner:
@@ -51,6 +62,9 @@ class SchedulerNavRunner:
         wait_timeout: float = 60.0,
         max_frames: int = 2500,
         service_radius: float = DEFAULT_SERVICE_RADIUS,
+        sync_docking_radius: float = DEFAULT_SYNC_DOCKING_RADIUS,
+        slot_capture_radius: float = DEFAULT_SLOT_CAPTURE_RADIUS_PIXELS,
+        final_snap_radius: float = DEFAULT_FINAL_SNAP_RADIUS,
         render: bool = False,
         gif_path: str | None = None,
     ):
@@ -59,6 +73,9 @@ class SchedulerNavRunner:
         self.wait_timeout = wait_timeout
         self.max_frames = max_frames
         self.service_radius = service_radius
+        self.sync_docking_radius = sync_docking_radius
+        self.slot_capture_radius = slot_capture_radius
+        self.final_snap_radius = final_snap_radius
         self.render = render
         self.gif_path = gif_path
         self.rng = np.random.default_rng(0)
@@ -128,6 +145,8 @@ class SchedulerNavRunner:
                 "blocked_count": 0,
                 "location_type": "start",
                 "location_id": None,
+                "assigned_slot_index": None,
+                "assigned_slot_pos": None,
                 "global_path": [],
                 "lookahead_wp": tuple(robot["start_pos"]),
                 "last_collision": 0.0,
@@ -147,16 +166,121 @@ class SchedulerNavRunner:
                 "onsite_robot_ids": set(),
                 "contributors": set(),
                 "completed_at": None,
+                "slot_positions": self._build_task_slots(task),
+                "slot_assignments": {},
             }
             for task in scenario["tasks"]
         }
+        for task_id, task_state in self.task_states.items():
+            task = task_state["spec"]
+            if task.get("kind") != "sync":
+                continue
+            required_slots = max(1, sum(task.get("required_roles", {}).values()))
+            if len(task_state["slot_positions"]) < required_slots:
+                raise ValueError(f"协同任务 {task_id} 缺少足够停靠位，无法联调。")
         if self.low_level_adapter is not None:
             self.low_level_adapter.reset(self.robot_order)
+
+    def _build_task_slots(self, task: Dict) -> List[Tuple[float, float]]:
+        if task.get("kind") != "sync":
+            return []
+        slot_count = max(1, sum(task.get("required_roles", {}).values()))
+        return generate_docking_slots(
+            task_pos=task["pos"],
+            slot_count=slot_count,
+            obstacles=self.scenario["obstacles"],
+            width=WIDTH,
+            height=HEIGHT,
+            robot_radius=15.0,
+            docking_radius=self.sync_docking_radius,
+            planner_margin=DEFAULT_PLANNER_MARGIN,
+            planner_resolution=DEFAULT_PLANNER_RESOLUTION,
+        )
+
+    def _robot_target_pos(self, robot_id: str) -> Tuple[float, float]:
+        robot = self.robot_states[robot_id]
+        task_id = robot.get("assigned_task")
+        if task_id is None:
+            return (robot["x"], robot["y"])
+        if self.task_specs[task_id].get("kind") == "sync" and robot.get("assigned_slot_pos") is not None:
+            return tuple(robot["assigned_slot_pos"])
+        return tuple(self.task_specs[task_id]["pos"])
+
+    def _distance_to_target(self, robot_id: str) -> float:
+        robot = self.robot_states[robot_id]
+        target_x, target_y = self._robot_target_pos(robot_id)
+        return math.hypot(robot["x"] - target_x, robot["y"] - target_y)
+
+    def _is_service_ready(self, robot_id: str) -> bool:
+        robot = self.robot_states[robot_id]
+        task_id = robot.get("assigned_task")
+        if task_id is None:
+            return False
+        if self.task_specs[task_id].get("kind") == "sync":
+            return self._distance_to_target(robot_id) <= self.slot_capture_radius
+        return self._distance_to_task(robot_id, task_id) <= self.service_radius
+
+    def _assign_slot(self, robot_id: str, task_id: str) -> None:
+        task = self.task_specs[task_id]
+        robot = self.robot_states[robot_id]
+        if task.get("kind") != "sync":
+            robot["assigned_slot_index"] = None
+            robot["assigned_slot_pos"] = None
+            return
+
+        task_state = self.task_states[task_id]
+        slot_positions = task_state["slot_positions"]
+        if not slot_positions:
+            raise ValueError(f"协同任务 {task_id} 没有可用停靠位。")
+
+        current_index = robot.get("assigned_slot_index")
+        assignments = task_state["slot_assignments"]
+        if current_index is not None and assignments.get(current_index) == robot_id:
+            robot["assigned_slot_pos"] = slot_positions[current_index]
+            return
+
+        free_indices = [
+            slot_index
+            for slot_index in range(len(slot_positions))
+            if assignments.get(slot_index) in {None, robot_id}
+        ]
+        if not free_indices:
+            raise ValueError(f"协同任务 {task_id} 的停靠位已全部占用。")
+
+        robot_pos = (robot["x"], robot["y"])
+        best_index = min(
+            free_indices,
+            key=lambda slot_index: math.hypot(
+                robot_pos[0] - slot_positions[slot_index][0],
+                robot_pos[1] - slot_positions[slot_index][1],
+            ),
+        )
+        assignments[best_index] = robot_id
+        robot["assigned_slot_index"] = best_index
+        robot["assigned_slot_pos"] = slot_positions[best_index]
+
+    def _release_slot(self, robot_id: str, task_id: Optional[str]) -> None:
+        robot = self.robot_states[robot_id]
+        if task_id is None:
+            robot["assigned_slot_index"] = None
+            robot["assigned_slot_pos"] = None
+            return
+
+        task_state = self.task_states.get(task_id)
+        slot_index = robot.get("assigned_slot_index")
+        if task_state is not None and slot_index is not None:
+            if task_state["slot_assignments"].get(slot_index) == robot_id:
+                del task_state["slot_assignments"][slot_index]
+
+        robot["assigned_slot_index"] = None
+        robot["assigned_slot_pos"] = None
 
     def _neighbors(self, robot_id: str) -> list[Dict]:
         neighbors = []
         for other_id, other in self.robot_states.items():
             if other_id == robot_id:
+                continue
+            if self._should_relax_same_task_collision(robot_id, other_id) or self._should_ignore_neighbor(robot_id, other_id):
                 continue
             neighbors.append({"id": other_id, "x": other["x"], "y": other["y"], "radius": other["radius"]})
         return neighbors
@@ -165,6 +289,81 @@ class SchedulerNavRunner:
         robot = self.robot_states[robot_id]
         task = self.task_specs[task_id]
         return math.hypot(robot["x"] - task["pos"][0], robot["y"] - task["pos"][1])
+
+    def _task_zone_contains(self, task_id: str, x: float, y: float, extra: float = 0.0) -> bool:
+        task = self.task_specs[task_id]
+        return math.hypot(x - task["pos"][0], y - task["pos"][1]) <= self.service_radius + extra
+
+    def _should_relax_same_task_collision(
+        self,
+        robot_id: str,
+        other_id: str,
+        candidate_x: float | None = None,
+        candidate_y: float | None = None,
+    ) -> bool:
+        robot = self.robot_states[robot_id]
+        other = self.robot_states[other_id]
+        task_id = robot.get("assigned_task")
+        if task_id is None or task_id != other.get("assigned_task"):
+            return False
+        if self.task_specs[task_id].get("kind") != "sync":
+            return False
+
+        cx = robot["x"] if candidate_x is None else candidate_x
+        cy = robot["y"] if candidate_y is None else candidate_y
+        return self._task_zone_contains(task_id, cx, cy, extra=robot["radius"]) and self._task_zone_contains(
+            task_id,
+            other["x"],
+            other["y"],
+            extra=other["radius"],
+        )
+
+    def _should_ignore_neighbor(self, robot_id: str, other_id: str) -> bool:
+        robot = self.robot_states[robot_id]
+        other = self.robot_states[other_id]
+        task_id = robot.get("assigned_task")
+        if task_id is None or task_id != other.get("assigned_task"):
+            return False
+        if self.task_specs[task_id].get("kind") != "sync":
+            return False
+
+        robot_near_task = self._task_zone_contains(task_id, robot["x"], robot["y"], extra=robot["radius"])
+        other_near_task = self._task_zone_contains(task_id, other["x"], other["y"], extra=other["radius"])
+        return robot_near_task or other_near_task or other.get("status") == "onsite"
+
+    def _use_task_zone_guidance(self, robot_id: str) -> bool:
+        robot = self.robot_states[robot_id]
+        task_id = robot.get("assigned_task")
+        if task_id is None:
+            return False
+        if self.task_specs[task_id].get("kind") != "sync":
+            return False
+        return self._task_zone_contains(task_id, robot["x"], robot["y"], extra=robot["radius"])
+
+    def _try_snap_to_target(self, robot_id: str) -> bool:
+        robot = self.robot_states[robot_id]
+        task_id = robot.get("assigned_task")
+        if task_id is None:
+            return False
+
+        snap_radius = self.final_snap_radius
+        if self.task_specs[task_id].get("kind") == "sync":
+            snap_radius = max(self.final_snap_radius, self.slot_capture_radius + 4.0)
+
+        if self._distance_to_target(robot_id) > snap_radius:
+            return False
+
+        target_x, target_y = self._robot_target_pos(robot_id)
+        robot["x"] = float(target_x)
+        robot["y"] = float(target_y)
+        robot["position"] = (robot["x"], robot["y"])
+        robot["position_history"].append((robot["x"], robot["y"]))
+        robot["last_collision"] = 0.0
+        robot["lookahead_wp"] = (robot["x"], robot["y"])
+        robot["status"] = "onsite"
+        robot["eta_remaining"] = 0.0
+        self.task_states[task_id]["onsite_robot_ids"].add(robot_id)
+        return True
 
     def _path_remaining_length(self, robot: Dict) -> float:
         path = robot.get("global_path") or []
@@ -253,17 +452,19 @@ class SchedulerNavRunner:
 
     def _assign_robot(self, robot_id: str, task_id: str) -> None:
         robot = self.robot_states[robot_id]
-        task = self.task_specs[task_id]
         robot["status"] = "travel"
         robot["assigned_task"] = task_id
+        self._assign_slot(robot_id, task_id)
         robot["wait_elapsed"] = 0.0
         robot["frames_since_replan"] = 999
-        robot["lookahead_wp"] = tuple(task["pos"])
+        robot["lookahead_wp"] = self._robot_target_pos(robot_id)
         self.task_states[task_id]["assigned_robot_ids"].add(robot_id)
 
-        if self._distance_to_task(robot_id, task_id) <= self.service_radius:
+        if self._is_service_ready(robot_id):
             robot["status"] = "onsite"
             self.task_states[task_id]["onsite_robot_ids"].add(robot_id)
+        else:
+            self.task_states[task_id]["onsite_robot_ids"].discard(robot_id)
 
         robot["eta_remaining"] = self._estimate_eta(robot_id, task_id)
 
@@ -275,6 +476,9 @@ class SchedulerNavRunner:
             self.task_states[task_id]["contributors"].discard(robot_id)
             robot["location_type"] = "task"
             robot["location_id"] = task_id
+            self._release_slot(robot_id, task_id)
+        else:
+            self._release_slot(robot_id, None)
 
         robot["status"] = "idle"
         robot["assigned_task"] = None
@@ -324,6 +528,8 @@ class SchedulerNavRunner:
         for other_id, other in self.robot_states.items():
             if other_id == robot_id:
                 continue
+            if self._should_relax_same_task_collision(robot_id, other_id, candidate_x=x, candidate_y=y):
+                continue
             if math.hypot(x - other["x"], y - other["y"]) < self.robot_states[robot_id]["radius"] + other["radius"]:
                 return True
         return False
@@ -364,16 +570,23 @@ class SchedulerNavRunner:
         for robot_id, robot in self.robot_states.items():
             status = robot["status"]
             if status == "travel" and robot["assigned_task"]:
-                task = self.task_specs[robot["assigned_task"]]
+                if self._try_snap_to_target(robot_id):
+                    continue
+                target_pos = self._robot_target_pos(robot_id)
                 if robot["frames_since_replan"] >= 5:
                     planner = AStarPlanner(width=WIDTH, height=HEIGHT, resolution=10, robot_radius=int(robot["radius"]), margin=5)
-                    robot["global_path"] = planner.plan((robot["x"], robot["y"]), task["pos"], obstacle_rects)
+                    robot["global_path"] = planner.plan((robot["x"], robot["y"]), target_pos, obstacle_rects)
                     robot["frames_since_replan"] = 0
                 else:
                     robot["frames_since_replan"] += 1
                 lookahead = 40.0 if robot["last_collision"] else 60.0
                 robot["lookahead_wp"] = get_lookahead_waypoint((robot["x"], robot["y"]), robot["global_path"], lookahead_dist=lookahead)
-                if self.low_level_adapter is None:
+                if self._use_task_zone_guidance(robot_id):
+                    dx = target_pos[0] - robot["x"]
+                    dy = target_pos[1] - robot["y"]
+                    norm = max(math.hypot(dx, dy), EPS)
+                    action = np.asarray([dx / norm, dy / norm], dtype=np.float32)
+                elif self.low_level_adapter is None:
                     dx = robot["lookahead_wp"][0] - robot["x"]
                     dy = robot["lookahead_wp"][1] - robot["y"]
                     norm = max(math.hypot(dx, dy), EPS)
@@ -387,9 +600,11 @@ class SchedulerNavRunner:
                     )
                 self._apply_physics(robot_id, action)
                 robot["travel_time"] += SIM_DT
+                if self._try_snap_to_target(robot_id):
+                    continue
                 remaining_length = self._path_remaining_length(robot)
                 robot["eta_remaining"] = remaining_length / max(BASE_TRAVEL_SPEED * robot["speed_multiplier"], EPS)
-                if self._distance_to_task(robot_id, robot["assigned_task"]) <= self.service_radius:
+                if self._is_service_ready(robot_id):
                     robot["status"] = "onsite"
                     robot["eta_remaining"] = 0.0
                     self.task_states[robot["assigned_task"]]["onsite_robot_ids"].add(robot_id)
@@ -405,9 +620,11 @@ class SchedulerNavRunner:
         for robot_id, robot in self.robot_states.items():
             assigned_task = robot["assigned_task"]
             distance_to_task = float("inf")
+            service_ready = False
             if assigned_task is not None:
                 distance_to_task = self._distance_to_task(robot_id, assigned_task)
-                if distance_to_task <= self.service_radius:
+                service_ready = self._is_service_ready(robot_id)
+                if service_ready:
                     self.task_states[assigned_task]["onsite_robot_ids"].add(robot_id)
                 else:
                     self.task_states[assigned_task]["onsite_robot_ids"].discard(robot_id)
@@ -419,6 +636,7 @@ class SchedulerNavRunner:
                     "service_multiplier": robot["service_multiplier"],
                     "assigned_task": assigned_task,
                     "distance_to_task": distance_to_task,
+                    "service_ready": service_ready,
                 }
             )
 
@@ -514,6 +732,8 @@ class SchedulerNavRunner:
                 color = YELLOW
 
             px, py = int(task["pos"][0]), int(task["pos"][1])
+            if task.get("kind") == "sync":
+                pygame.draw.circle(screen, LIGHT_GRAY, (px, py), int(self.service_radius), 1)
             pygame.draw.circle(screen, color, (px, py), 18)
             pygame.draw.circle(screen, BLACK, (px, py), 18, 2)
             label = font.render(task_id.split()[-1], True, (255, 255, 255))
@@ -526,6 +746,18 @@ class SchedulerNavRunner:
             for parent in task.get("precedence", []):
                 parent_task = self.task_specs[parent]
                 pygame.draw.line(screen, (90, 90, 90), parent_task["pos"], task["pos"], 2)
+
+            for slot_index, slot_pos in enumerate(state.get("slot_positions", [])):
+                assigned_robot = state.get("slot_assignments", {}).get(slot_index)
+                if assigned_robot is None:
+                    slot_color = LIGHT_GRAY
+                elif assigned_robot in state.get("onsite_robot_ids", set()):
+                    slot_color = BLUE
+                else:
+                    slot_color = ORANGE
+                slot_center = (int(slot_pos[0]), int(slot_pos[1]))
+                pygame.draw.circle(screen, slot_color, slot_center, 7)
+                pygame.draw.circle(screen, BLACK, slot_center, 7, 1)
 
         for robot_id in self.robot_order:
             robot = self.robot_states[robot_id]
@@ -545,12 +777,17 @@ class SchedulerNavRunner:
                     pygame.draw.lines(screen, color, False, points, 2)
             if robot.get("lookahead_wp"):
                 pygame.draw.circle(screen, color, (int(robot["lookahead_wp"][0]), int(robot["lookahead_wp"][1])), 6)
+            if robot.get("assigned_slot_pos") is not None and robot.get("assigned_task") is not None:
+                slot_pos = robot["assigned_slot_pos"]
+                pygame.draw.line(screen, color, pos, (int(slot_pos[0]), int(slot_pos[1])), 1)
 
             status = robot["status"]
             target = robot.get("assigned_task")
             info = f"{robot_id} {status}"
             if target:
                 info += f"->{target.split()[-1]}"
+            if robot.get("assigned_slot_index") is not None:
+                info += f" s{robot['assigned_slot_index']}"
             if robot["wait_elapsed"] > 0.0:
                 info += f" w={robot['wait_elapsed']:.0f}"
             text = small_font.render(info, True, BLACK)

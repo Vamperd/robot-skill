@@ -109,7 +109,11 @@ class ContinuousTaskRuntime:
                 snapshot["id"]
                 for snapshot in robot_snapshots
                 if snapshot.get("assigned_task") == task_id
-                and snapshot.get("distance_to_task", float("inf")) <= self.service_radius
+                and (
+                    bool(snapshot["service_ready"])
+                    if "service_ready" in snapshot
+                    else snapshot.get("distance_to_task", float("inf")) <= self.service_radius
+                )
             ]
             state["present_robot_ids"] = set(present_robot_ids)
 
