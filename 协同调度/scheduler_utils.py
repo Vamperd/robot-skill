@@ -13,9 +13,10 @@ ROLE_NAMES = tuple(ROBOT_ROLES.keys())
 ROLE_TO_INDEX = {role: index for index, role in enumerate(ROLE_NAMES)}
 ROLE_DIM = len(ROLE_NAMES)
 MAX_ROLE_COUNT = 3.0
-ROBOT_FEATURE_DIM = 12 + ROLE_DIM
-TASK_FEATURE_DIM = 12 + ROLE_DIM
+ROBOT_FEATURE_DIM = 17 + ROLE_DIM
+TASK_FEATURE_DIM = 16 + ROLE_DIM
 EPS = 1e-6
+DISPATCHABLE_STATUSES = {"idle", "waiting_idle", "waiting_sync"}
 
 
 def task_id_from_action(action_value: int, task_order: Sequence[str]) -> Optional[str]:
@@ -143,7 +144,7 @@ def legal_action_mask_for_robot(
     mask[0] = 1.0
 
     robot = robot_states[robot_id]
-    if robot.get("status") not in {"idle", "waiting_idle"}:
+    if robot.get("status") not in DISPATCHABLE_STATUSES:
         return mask
 
     pending_assignments = pending_task_assignments(robot_order, task_order, pending_actions)
@@ -190,31 +191,43 @@ def legal_action_mask_for_robot(
     return mask
 
 
-def role_aware_greedy_action_for_robot(
+def constrain_wait_action_mask(
+    action_mask: np.ndarray,
+    robot_state: Dict,
+    *,
+    suppress_statuses: Sequence[str] = ("idle", "waiting_idle"),
+) -> np.ndarray:
+    constrained = np.array(action_mask, copy=True, dtype=np.float32)
+    if constrained.size <= 1:
+        return constrained
+    if robot_state.get("status") in set(suppress_statuses) and np.any(constrained[1:] > 0.0):
+        constrained[0] = 0.0
+    return constrained
+
+
+def fallback_legal_action_from_mask(action_mask: np.ndarray) -> int:
+    legal_actions = [int(action) for action in np.flatnonzero(action_mask > 0.0)]
+    non_wait_actions = [action for action in legal_actions if action != 0]
+    if non_wait_actions:
+        return non_wait_actions[0]
+    if legal_actions:
+        return legal_actions[0]
+    return 0
+
+
+def _rank_legal_tasks_for_robot(
     robot_id: str,
-    robot_order: Sequence[str],
     task_order: Sequence[str],
     robot_states: Dict[str, Dict],
     task_states: Dict[str, Dict],
     task_specs: Dict[str, Dict],
     robot_task_eta_row: np.ndarray,
-    pending_actions: Sequence[int],
+    pending_assignments: Dict[str, set[str]],
+    action_mask: np.ndarray,
     max_tasks: int,
-) -> int:
-    action_mask = legal_action_mask_for_robot(
-        robot_id=robot_id,
-        robot_order=robot_order,
-        task_order=task_order,
-        robot_states=robot_states,
-        task_states=task_states,
-        task_specs=task_specs,
-        pending_actions=pending_actions,
-        max_tasks=max_tasks,
-    )
+) -> List[tuple[float, float, int, str]]:
     robot = robot_states[robot_id]
-    ranked = []
-
-    pending_assignments = pending_task_assignments(robot_order, task_order, pending_actions)
+    ranked: List[tuple[float, float, int, str]] = []
 
     for task_slot, task_id in enumerate(task_order, start=1):
         if task_slot > max_tasks or action_mask[task_slot] <= 0.0:
@@ -235,8 +248,100 @@ def role_aware_greedy_action_for_robot(
             deficit_bonus = 0.05 * float(deficit.get(robot.get("role"), 0))
 
         score = eta + precedence_penalty - role_bonus - priority_bonus - sync_bonus - deficit_bonus
-        ranked.append((score, eta, task_slot))
+        ranked.append((score, eta, task_slot, task_id))
 
+    return ranked
+
+
+def role_aware_greedy_action_for_robot(
+    robot_id: str,
+    robot_order: Sequence[str],
+    task_order: Sequence[str],
+    robot_states: Dict[str, Dict],
+    task_states: Dict[str, Dict],
+    task_specs: Dict[str, Dict],
+    robot_task_eta_row: np.ndarray,
+    pending_actions: Sequence[int],
+    max_tasks: int,
+) -> int:
+    if robot_states[robot_id].get("status") == "waiting_sync":
+        return 0
+
+    action_mask = legal_action_mask_for_robot(
+        robot_id=robot_id,
+        robot_order=robot_order,
+        task_order=task_order,
+        robot_states=robot_states,
+        task_states=task_states,
+        task_specs=task_specs,
+        pending_actions=pending_actions,
+        max_tasks=max_tasks,
+    )
+    pending_assignments = pending_task_assignments(robot_order, task_order, pending_actions)
+    ranked = _rank_legal_tasks_for_robot(
+        robot_id=robot_id,
+        task_order=task_order,
+        robot_states=robot_states,
+        task_states=task_states,
+        task_specs=task_specs,
+        robot_task_eta_row=robot_task_eta_row,
+        pending_assignments=pending_assignments,
+        action_mask=action_mask,
+        max_tasks=max_tasks,
+    )
+
+    if not ranked:
+        return 0
+    return int(min(ranked, key=lambda item: (item[0], item[1]))[2])
+
+
+def wait_aware_role_greedy_action_for_robot(
+    robot_id: str,
+    robot_order: Sequence[str],
+    task_order: Sequence[str],
+    robot_states: Dict[str, Dict],
+    task_states: Dict[str, Dict],
+    task_specs: Dict[str, Dict],
+    robot_task_eta_row: np.ndarray,
+    pending_actions: Sequence[int],
+    max_tasks: int,
+) -> int:
+    robot = robot_states[robot_id]
+    if robot.get("status") != "waiting_sync" or not robot.get("has_better_alternative", False):
+        return role_aware_greedy_action_for_robot(
+            robot_id=robot_id,
+            robot_order=robot_order,
+            task_order=task_order,
+            robot_states=robot_states,
+            task_states=task_states,
+            task_specs=task_specs,
+            robot_task_eta_row=robot_task_eta_row,
+            pending_actions=pending_actions,
+            max_tasks=max_tasks,
+        )
+
+    action_mask = legal_action_mask_for_robot(
+        robot_id=robot_id,
+        robot_order=robot_order,
+        task_order=task_order,
+        robot_states=robot_states,
+        task_states=task_states,
+        task_specs=task_specs,
+        pending_actions=pending_actions,
+        max_tasks=max_tasks,
+    )
+    pending_assignments = pending_task_assignments(robot_order, task_order, pending_actions)
+    ranked = _rank_legal_tasks_for_robot(
+        robot_id=robot_id,
+        task_order=task_order,
+        robot_states=robot_states,
+        task_states=task_states,
+        task_specs=task_specs,
+        robot_task_eta_row=robot_task_eta_row,
+        pending_assignments=pending_assignments,
+        action_mask=action_mask,
+        max_tasks=max_tasks,
+    )
     if not ranked:
         return 0
     return int(min(ranked, key=lambda item: (item[0], item[1]))[2])
@@ -274,6 +379,7 @@ def build_scheduler_observation(
                 float(status == "travel"),
                 float(status == "onsite"),
                 float(status == "waiting_idle"),
+                float(status == "waiting_sync"),
             ],
             dtype=np.float32,
         )
@@ -288,6 +394,10 @@ def build_scheduler_observation(
                 min(float(robot.get("eta_remaining", 0.0)) / max(max_time, EPS), 1.0),
                 min(float(robot.get("wait_elapsed", 0.0)) / max(wait_timeout, EPS), 1.0),
                 min(float(robot.get("blocked_count", 0.0)) / 5.0, 1.0),
+                float(robot.get("has_legal_alternative", False)),
+                float(robot.get("has_better_alternative", False)),
+                min(float(robot.get("best_alternative_eta", max_time)) / max(max_time, EPS), 1.0),
+                min(float(robot.get("current_task_ready_eta", 0.0)) / max(max_time, EPS), 1.0),
             ],
             dtype=np.float32,
         )
@@ -315,6 +425,8 @@ def build_scheduler_observation(
         assigned_count = len(set(task_state.get("assigned_robot_ids", set())) | pending_assignments.get(task_id, set()))
         onsite_count = len(task_state.get("onsite_robot_ids", set()))
         contributor_count = len(task_state.get("contributors", set()))
+        waiting_sync_count = len(task_state.get("waiting_sync_robot_ids", set()))
+        avoidable_wait_count = len(task_state.get("avoidable_waiting_robot_ids", set()))
         required_roles = task.get("required_roles", {})
         base = np.array(
             [
@@ -330,6 +442,10 @@ def build_scheduler_observation(
                 min(float(assigned_count) / MAX_ROLE_COUNT, 1.0),
                 min(float(onsite_count) / MAX_ROLE_COUNT, 1.0),
                 min(float(contributor_count) / MAX_ROLE_COUNT, 1.0),
+                min(float(waiting_sync_count) / MAX_ROLE_COUNT, 1.0),
+                min(float(avoidable_wait_count) / MAX_ROLE_COUNT, 1.0),
+                min(float(task_state.get("coalition_ready_eta", 0.0)) / max(max_time, EPS), 1.0),
+                min(float(task_state.get("activation_delay", 0.0)) / max(max_time, EPS), 1.0),
             ],
             dtype=np.float32,
         )
@@ -348,6 +464,7 @@ def build_scheduler_observation(
             pending_actions=pending_actions,
             max_tasks=max_tasks,
         )
+        current_action_mask = constrain_wait_action_mask(current_action_mask, robot_states[current_robot_id])
     else:
         current_action_mask = np.zeros(max_tasks + 1, dtype=np.float32)
         current_action_mask[0] = 1.0
@@ -366,22 +483,29 @@ def build_scheduler_observation(
 
 
 def curriculum_families(progress: float) -> List[str]:
-    if progress < 0.25:
+    if progress < 0.20:
         return ["open_balance", "role_mismatch"]
-    if progress < 0.50:
+    if progress < 0.40:
         return ["open_balance", "role_mismatch", "single_bottleneck"]
-    if progress < 0.75:
-        return ["open_balance", "role_mismatch", "single_bottleneck", "double_bottleneck", "far_near_trap"]
-    return list(
-        [
+    if progress < 0.60:
+        return ["open_balance", "role_mismatch", "single_bottleneck", "far_near_trap"]
+    if progress < 0.80:
+        return [
             "open_balance",
             "role_mismatch",
             "single_bottleneck",
-            "double_bottleneck",
             "far_near_trap",
-            "multi_sync_cluster",
+            "partial_coalition_trap",
         ]
-    )
+    return [
+        "open_balance",
+        "role_mismatch",
+        "single_bottleneck",
+        "double_bottleneck",
+        "far_near_trap",
+        "multi_sync_cluster",
+        "partial_coalition_trap",
+    ]
 
 
 def load_split_scenarios(

@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--family", default=None)
     parser.add_argument("--scenario-index", type=int, default=0)
     parser.add_argument("--scenario-file", default=None)
-    parser.add_argument("--policy", default="role_aware_greedy", choices=["role_aware_greedy", "random", "model"])
+    parser.add_argument("--policy", default="wait_aware_role_greedy", choices=["wait_aware_role_greedy", "role_aware_greedy", "random", "model"])
     parser.add_argument("--model", default=None)
     parser.add_argument("--decision-delay-ms", type=int, default=350)
     parser.add_argument("--gif-name", default=None)
@@ -77,6 +77,8 @@ def draw_scene(screen, font, small_font, env: SequentialSchedulingEnv, obs: dict
             color = LOCKED_COLOR
         elif state["contributors"]:
             color = ACTIVE_COLOR
+        elif state["waiting_sync_robot_ids"]:
+            color = WAITING_COLOR
         elif state["assigned_robot_ids"] or state["onsite_robot_ids"]:
             color = WAITING_COLOR
         else:
@@ -93,7 +95,8 @@ def draw_scene(screen, font, small_font, env: SequentialSchedulingEnv, obs: dict
         pygame.draw.rect(screen, COMPLETE_COLOR, (bar_x + 1, bar_y + 1, int(42 * min(progress, 1.0)), 4))
 
         req = " ".join(f"{role[0]}:{count}" for role, count in task.get("required_roles", {}).items())
-        info = small_font.render(f"{task['kind']} {req}", True, TEXT_COLOR)
+        wait_info = len(state.get("waiting_sync_robot_ids", set()))
+        info = small_font.render(f"{task['kind']} {req} wait={wait_info}", True, TEXT_COLOR)
         screen.blit(info, (pos[0] - 25, pos[1] - 36))
 
     for task in scenario["tasks"]:
@@ -129,6 +132,8 @@ def draw_scene(screen, font, small_font, env: SequentialSchedulingEnv, obs: dict
             status_text += f" -> {target_task}"
         if state.get("wait_elapsed", 0.0) > 0.0:
             status_text += f" w={state['wait_elapsed']:.1f}"
+        if state.get("has_better_alternative", False):
+            status_text += " reassign?"
         info = small_font.render(status_text, True, TEXT_COLOR)
         screen.blit(info, (pos[0] + 18, pos[1] - 12))
 
@@ -139,7 +144,7 @@ def draw_scene(screen, font, small_font, env: SequentialSchedulingEnv, obs: dict
     )
     screen.blit(title, (12, 12))
     line2 = font.render(
-        f"time={env.base_env.time:.1f} deadlock={env.base_env.metrics['deadlock_events']} timeout={env.base_env.metrics['timeout_events']}",
+        f"time={env.base_env.time:.1f} deadlock={env.base_env.metrics['deadlock_events']} timeout={env.base_env.metrics['timeout_events']} reassign={env.base_env.metrics['waiting_sync_reassign_count']}",
         True,
         TEXT_COLOR,
     )

@@ -56,6 +56,7 @@ from scheduler_utils import (
     build_scheduler_observation,
     legal_action_mask_for_robot,
     role_aware_greedy_action_for_robot,
+    wait_aware_role_greedy_action_for_robot,
     task_id_from_action,
 )
 
@@ -77,14 +78,24 @@ class SequentialSchedulingEnv(gym.Env):
         max_tasks: int = MAX_TASKS,
         max_time: float = 2500.0,
         wait_timeout: float = 60.0,
-        completion_reward: float = 100.0,
+        completion_reward: float = 25.0,
+        progress_reward_scale: float = 25.0,
+        coalition_activation_bonus: float = 5.0,
         illegal_action_penalty: float = 5.0,
         idle_penalty: float = 0.03,
-        wait_penalty: float = 0.06,
-        time_penalty: float = 0.02,
+        wait_penalty: float = 0.08,
+        time_penalty: float = 0.05,
         timeout_penalty: float = 8.0,
         deadlock_penalty: float = 20.0,
         deadlock_limit: int = 8,
+        avoidable_wait_penalty: float = 0.20,
+        reassign_progress_bonus_scale: float = 4.0,
+        reassign_completion_bonus: float = 2.0,
+        bad_reassign_penalty: float = 3.0,
+        reassign_margin: float = 20.0,
+        reassign_success_window_min: float = 150.0,
+        reassign_success_window_factor: float = 2.0,
+        reassign_success_window_max: float = 360.0,
     ):
         super().__init__()
         self.base_env = base_env or SchedulingEnv(
@@ -97,6 +108,8 @@ class SequentialSchedulingEnv(gym.Env):
             max_time=max_time,
             wait_timeout=wait_timeout,
             completion_reward=completion_reward,
+            progress_reward_scale=progress_reward_scale,
+            coalition_activation_bonus=coalition_activation_bonus,
             illegal_action_penalty=illegal_action_penalty,
             idle_penalty=idle_penalty,
             wait_penalty=wait_penalty,
@@ -104,6 +117,14 @@ class SequentialSchedulingEnv(gym.Env):
             timeout_penalty=timeout_penalty,
             deadlock_penalty=deadlock_penalty,
             deadlock_limit=deadlock_limit,
+            avoidable_wait_penalty=avoidable_wait_penalty,
+            reassign_progress_bonus_scale=reassign_progress_bonus_scale,
+            reassign_completion_bonus=reassign_completion_bonus,
+            bad_reassign_penalty=bad_reassign_penalty,
+            reassign_margin=reassign_margin,
+            reassign_success_window_min=reassign_success_window_min,
+            reassign_success_window_factor=reassign_success_window_factor,
+            reassign_success_window_max=reassign_success_window_max,
         )
         self.max_robots = self.base_env.max_robots
         self.max_tasks = self.base_env.max_tasks
@@ -146,7 +167,7 @@ class SequentialSchedulingEnv(gym.Env):
         slots: list[int] = []
         for slot, robot_id in enumerate(self.robot_order):
             robot = self.base_env.robot_states[robot_id]
-            if robot.get("status") in {"idle", "waiting_idle"}:
+            if robot.get("status") in {"idle", "waiting_idle", "waiting_sync"}:
                 slots.append(slot)
         return slots
 
@@ -263,6 +284,23 @@ class SequentialSchedulingEnv(gym.Env):
             return 0
         robot_id = self.robot_order[slot]
         return role_aware_greedy_action_for_robot(
+            robot_id=robot_id,
+            robot_order=self.robot_order,
+            task_order=self.task_order,
+            robot_states=self.base_env.robot_states,
+            task_states=self.base_env.task_states,
+            task_specs=self.base_env.task_specs,
+            robot_task_eta_row=self._normalized_robot_task_eta()[slot],
+            pending_actions=self.pending_actions,
+            max_tasks=self.max_tasks,
+        )
+
+    def wait_aware_action(self) -> int:
+        slot = self._current_slot()
+        if slot is None:
+            return 0
+        robot_id = self.robot_order[slot]
+        return wait_aware_role_greedy_action_for_robot(
             robot_id=robot_id,
             robot_order=self.robot_order,
             task_order=self.task_order,

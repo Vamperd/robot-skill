@@ -25,17 +25,17 @@ def obs_batch_to_torch(obs_batch, device: torch.device):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="使用 role_aware_greedy 进行高层调度行为克隆预热。")
+    parser = argparse.ArgumentParser(description="使用等待感知专家进行高层调度行为克隆预热。")
     parser.add_argument("--scenario-dir", default="offline_maps_v2")
     parser.add_argument("--train-split", default="train")
     parser.add_argument("--val-split", default="val")
-    parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--limit-train-per-family", type=int, default=None)
     parser.add_argument("--limit-val-per-family", type=int, default=None)
-    parser.add_argument("--save-dir", default="协同调度/checkpoints_bc")
+    parser.add_argument("--save-dir", default="协同调度/checkpoints_improve_bc")
     parser.add_argument("--init-model", default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
@@ -63,7 +63,7 @@ def main() -> None:
         raise ValueError("验证场景为空，请检查 val split。")
 
     print(f"收集专家轨迹: train={len(train_scenarios)} 个场景, val={len(val_scenarios)} 个场景")
-    samples = collect_expert_samples(train_scenarios, expert_policy="role_aware_greedy")
+    samples = collect_expert_samples(train_scenarios, expert_policy="wait_aware_role_greedy")
     dataset = SchedulerSupervisedDataset(samples)
     loader = DataLoader(
         dataset,
@@ -111,36 +111,31 @@ def main() -> None:
             val_metrics["success_rate"] * 1000.0
             - val_metrics["mean_makespan"]
             - 0.5 * val_metrics["mean_wait_time"]
+            - 0.75 * val_metrics["mean_avoidable_wait_time"]
         )
 
-        latest_path = save_dir / "latest_scheduler_bc.pt"
+        checkpoint_metadata = {
+            **metadata,
+            "stage": "behavior_cloning",
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "expert_policy": "wait_aware_role_greedy",
+            "val_metrics": val_metrics,
+        }
         save_scheduler_checkpoint(
-            latest_path,
+            save_dir / "latest_scheduler_bc.pt",
             model,
             optimizer=optimizer,
-            metadata={
-                **metadata,
-                "stage": "behavior_cloning",
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "val_metrics": val_metrics,
-            },
+            metadata=checkpoint_metadata,
         )
 
         if score > best_score:
             best_score = score
-            best_path = save_dir / "best_scheduler_bc.pt"
             save_scheduler_checkpoint(
-                best_path,
+                save_dir / "best_scheduler_bc.pt",
                 model,
                 optimizer=optimizer,
-                metadata={
-                    **metadata,
-                    "stage": "behavior_cloning",
-                    "epoch": epoch,
-                    "train_loss": train_loss,
-                    "val_metrics": val_metrics,
-                },
+                metadata=checkpoint_metadata,
             )
 
         print(
@@ -148,7 +143,9 @@ def main() -> None:
             f"loss={train_loss:.4f} "
             f"success={val_metrics['success_rate']:.3f} "
             f"makespan={val_metrics['mean_makespan']:.2f} "
-            f"wait={val_metrics['mean_wait_time']:.2f}"
+            f"wait={val_metrics['mean_wait_time']:.2f} "
+            f"avoidable_wait={val_metrics['mean_avoidable_wait_time']:.2f} "
+            f"reassign_rate={val_metrics['mean_productive_reassign_rate']:.3f}"
         )
 
 

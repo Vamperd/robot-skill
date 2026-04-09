@@ -25,8 +25,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--family", default=None)
     parser.add_argument("--limit", type=int, default=1)
     parser.add_argument("--scheduler-model", default=None, help="高层调度器 checkpoint；为空时使用 role_aware_greedy")
-    parser.add_argument("--scheduler-policy", default="role_aware_greedy", choices=["role_aware_greedy", "random"])
+    parser.add_argument(
+        "--scheduler-policy",
+        default="role_aware_greedy",
+        choices=["role_aware_greedy", "wait_aware_role_greedy", "upfront_wait_aware_greedy", "random"],
+    )
+    parser.add_argument(
+        "--scheduler-policy-type",
+        default="auto",
+        choices=["auto", "legacy", "hetero_ppo", "hetero_actor_only", "hetero_ranker"],
+        help="当提供 scheduler-model 时，指定或自动识别高层模型类型。",
+    )
     parser.add_argument("--low-level-model", default="导航结合RL运动/results/local_eval_best/best_model.zip")
+    parser.add_argument(
+        "--scheduler-guard-mode",
+        default="auto",
+        choices=["auto", "off", "hard_only"],
+        help="Conservative runtime guard mode for hetero_ranker deployment.",
+    )
+    parser.add_argument("--scheduler-min-margin", type=float, default=0.15)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--gif-name", default=None)
     parser.add_argument("--max-frames", type=int, default=2500)
@@ -48,7 +65,7 @@ def main() -> None:
 
     low_level_adapter = LowLevelPolicyAdapter.from_model(args.low_level_model)
     scheduler_policy = (
-        SchedulerNavRunner.load_scheduler(args.scheduler_model)
+        SchedulerNavRunner.load_scheduler(args.scheduler_model, policy_type=args.scheduler_policy_type)
         if args.scheduler_model
         else args.scheduler_policy
     )
@@ -56,6 +73,8 @@ def main() -> None:
         scheduler_policy=scheduler_policy,
         low_level_adapter=low_level_adapter,
         max_frames=args.max_frames,
+        scheduler_guard_mode=args.scheduler_guard_mode,
+        scheduler_min_margin=args.scheduler_min_margin,
     )
 
     for index, scenario in enumerate(scenarios):

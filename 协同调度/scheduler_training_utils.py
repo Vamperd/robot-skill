@@ -26,6 +26,8 @@ def policy_action(
     if isinstance(policy, str):
         if policy == "role_aware_greedy":
             return int(env.role_aware_action())
+        if policy == "wait_aware_role_greedy":
+            return int(env.wait_aware_action())
         if policy == "random":
             valid = np.flatnonzero(obs["current_action_mask"] > 0.0)
             return int(rng.choice(valid)) if len(valid) else 0
@@ -67,8 +69,12 @@ def evaluate_policy_on_scenarios(
                 "makespan": float(final_info.get("makespan", env.base_env.time)),
                 "completion_rate": float(final_info.get("completion_rate", 0.0)),
                 "average_wait_time": float(final_info.get("average_wait_time", 0.0)),
+                "average_avoidable_wait_time": float(final_info.get("average_avoidable_wait_time", 0.0)),
                 "idle_ratio": float(final_info.get("idle_ratio", 0.0)),
                 "deadlock_events": float(final_info.get("deadlock_events", 0.0)),
+                "waiting_sync_reassign_count": float(final_info.get("waiting_sync_reassign_count", 0.0)),
+                "productive_reassign_rate": float(final_info.get("productive_reassign_rate", 0.0)),
+                "coalition_activation_delay": float(final_info.get("coalition_activation_delay", 0.0)),
             }
         )
 
@@ -78,14 +84,18 @@ def evaluate_policy_on_scenarios(
         "mean_makespan": mean(item["makespan"] for item in metrics),
         "mean_completion_rate": mean(item["completion_rate"] for item in metrics),
         "mean_wait_time": mean(item["average_wait_time"] for item in metrics),
+        "mean_avoidable_wait_time": mean(item["average_avoidable_wait_time"] for item in metrics),
         "mean_idle_ratio": mean(item["idle_ratio"] for item in metrics),
         "mean_deadlock_events": mean(item["deadlock_events"] for item in metrics),
+        "mean_waiting_sync_reassign_count": mean(item["waiting_sync_reassign_count"] for item in metrics),
+        "mean_productive_reassign_rate": mean(item["productive_reassign_rate"] for item in metrics),
+        "mean_coalition_activation_delay": mean(item["coalition_activation_delay"] for item in metrics),
     }
 
 
 def collect_expert_samples(
     scenarios: Sequence[Dict],
-    expert_policy: str = "role_aware_greedy",
+    expert_policy: str = "wait_aware_role_greedy",
     max_episodes: int | None = None,
     seed: int = 0,
 ) -> List[tuple[Dict[str, np.ndarray], int]]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import sys
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -20,8 +21,23 @@ if str(SCHED_DIR) not in sys.path:
 
 from scheduler_utils import (  # noqa: E402
     build_scheduler_observation,
+    constrain_wait_action_mask,
+    fallback_legal_action_from_mask,
     legal_action_mask_for_robot,
+    pending_task_assignments,
+    precedence_state_vector,
     role_aware_greedy_action_for_robot,
+    task_id_from_action,
+    wait_aware_role_greedy_action_for_robot,
+    remaining_role_deficit_matrix,
+)
+from hetero_attention_policy import (  # noqa: E402
+    load_hetero_policy_checkpoint,
+    obs_to_torch as hetero_obs_to_torch,
+)
+from hetero_dispatch_env import (  # noqa: E402
+    TASK_IDX,
+    build_hetero_scheduler_observation,
 )
 from coop_docking import (  # noqa: E402
     DEFAULT_DOCKING_RADIUS,
@@ -30,7 +46,7 @@ from coop_docking import (  # noqa: E402
     DEFAULT_SLOT_CAPTURE_RADIUS,
     generate_docking_slots,
 )
-from task_runtime import ContinuousTaskRuntime  # noqa: E402
+from task_runtime import ContinuousTaskRuntime, service_rate  # noqa: E402
 
 
 WHITE = (240, 240, 240)
@@ -52,6 +68,20 @@ EPS = 1e-6
 DEFAULT_SYNC_DOCKING_RADIUS = DEFAULT_DOCKING_RADIUS
 DEFAULT_SLOT_CAPTURE_RADIUS_PIXELS = DEFAULT_SLOT_CAPTURE_RADIUS
 DEFAULT_FINAL_SNAP_RADIUS = 18.0
+RANKER_GUARD_FAMILIES = {
+    "role_mismatch",
+    "single_bottleneck",
+    "double_bottleneck",
+    "multi_sync_cluster",
+    "partial_coalition_trap",
+}
+
+
+@dataclass
+class LoadedSchedulerPolicy:
+    policy_type: str
+    model: object
+    metadata: Dict[str, object]
 
 
 class SchedulerNavRunner:
@@ -65,6 +95,8 @@ class SchedulerNavRunner:
         sync_docking_radius: float = DEFAULT_SYNC_DOCKING_RADIUS,
         slot_capture_radius: float = DEFAULT_SLOT_CAPTURE_RADIUS_PIXELS,
         final_snap_radius: float = DEFAULT_FINAL_SNAP_RADIUS,
+        scheduler_guard_mode: str = "auto",
+        scheduler_min_margin: float = 0.15,
         render: bool = False,
         gif_path: str | None = None,
     ):
@@ -76,6 +108,8 @@ class SchedulerNavRunner:
         self.sync_docking_radius = sync_docking_radius
         self.slot_capture_radius = slot_capture_radius
         self.final_snap_radius = final_snap_radius
+        self.scheduler_guard_mode = scheduler_guard_mode
+        self.scheduler_min_margin = scheduler_min_margin
         self.render = render
         self.gif_path = gif_path
         self.rng = np.random.default_rng(0)
@@ -96,13 +130,39 @@ class SchedulerNavRunner:
         self.completed_order: list[str] = []
 
     @classmethod
-    def load_scheduler(cls, model_path: str | None, device: torch.device | str = "cpu"):
+    def load_scheduler(
+        cls,
+        model_path: str | None,
+        device: "torch.device | str" = "cpu",
+        policy_type: str = "auto",
+    ):
         if model_path is None:
             return "role_aware_greedy"
+        import torch
+
+        checkpoint_path = Path(model_path).expanduser().resolve(strict=False)
+        checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+        detected_policy_type = policy_type
+        if detected_policy_type == "auto":
+            detected_policy_type = checkpoint.get("policy_type") or checkpoint.get("metadata", {}).get("policy_type") or "legacy"
+
+        if detected_policy_type in {"hetero_ppo", "hetero_actor_only", "hetero_ranker"}:
+            model, hetero_checkpoint = load_hetero_policy_checkpoint(checkpoint_path, device=device)
+            actual_policy_type = (
+                hetero_checkpoint.get("policy_type")
+                or hetero_checkpoint.get("metadata", {}).get("policy_type")
+                or detected_policy_type
+            )
+            return LoadedSchedulerPolicy(
+                policy_type=str(actual_policy_type),
+                model=model,
+                metadata=hetero_checkpoint.get("metadata", {}),
+            )
+
         from attention_policy import load_scheduler_checkpoint
 
-        model, _ = load_scheduler_checkpoint(model_path, device=device)
-        return model
+        model, _ = load_scheduler_checkpoint(checkpoint_path, device=device)
+        return LoadedSchedulerPolicy(policy_type="legacy", model=model, metadata={})
 
     def _init_state(self, scenario: Dict) -> None:
         self.scenario = scenario
@@ -121,6 +181,18 @@ class SchedulerNavRunner:
             "timeout_events": 0,
             "deadlock_events": 0,
             "illegal_actions": 0,
+            "decision_count": 0,
+            "wait_action_count": 0,
+            "idle_legal_decision_count": 0,
+            "idle_wait_action_count": 0,
+            "waiting_idle_legal_decision_count": 0,
+            "waiting_idle_wait_action_count": 0,
+            "stalled_wait_count": 0,
+            "wait_flip_count": 0,
+            "waiting_idle_fallback_count": 0,
+            "ranker_guard_trigger_count": 0,
+            "ranker_low_margin_count": 0,
+            "ranker_unsafe_checkpoint_count": 0,
         }
 
         self.robot_states = {}
@@ -154,6 +226,8 @@ class SchedulerNavRunner:
                 "task_progress": 0.0,
                 "is_finished": False,
                 "frames_since_replan": 999,
+                "last_dispatch_was_wait": None,
+                "waiting_idle_legal_streak": 0,
             }
             self.robot_states[robot["id"]]["position_history"].append(tuple(robot["start_pos"]))
 
@@ -390,6 +464,196 @@ class SchedulerNavRunner:
 
         return float(matrix["robot_to_task"][robot_id][task_id]["eta"])
 
+    def _contributors_for_task(self, task_id: str) -> list[str]:
+        return sorted(self.task_states[task_id]["contributors"])
+
+    def _task_progress_remaining(self, task_id: str) -> float:
+        task = self.task_specs[task_id]
+        progress = float(self.task_states[task_id]["progress"])
+        return max(float(task["service_time"]) - progress, 0.0)
+
+    def _service_eta_for_task(self, task_id: str) -> float:
+        task_state = self.task_states[task_id]
+        if task_state["completed"]:
+            return 0.0
+        contributors = self._contributors_for_task(task_id)
+        if not contributors:
+            return float("inf")
+        rate = service_rate(
+            contributors,
+            {
+                robot_id: {"service_multiplier": self.robot_states[robot_id]["service_multiplier"]}
+                for robot_id in contributors
+            },
+        )
+        if rate <= EPS:
+            return float("inf")
+        return self._task_progress_remaining(task_id) / rate
+
+    def _task_unlock_value(self, task_id: str) -> int:
+        return sum(task_id in task.get("precedence", []) for task in self.task_specs.values())
+
+    def _robot_release_eta(self, robot_id: str) -> float:
+        robot = self.robot_states[robot_id]
+        status = robot.get("status")
+        task_id = robot.get("assigned_task")
+        if status in {"idle", "waiting_idle"}:
+            return 0.0
+        if status == "travel":
+            return float(robot.get("eta_remaining", 0.0))
+        if status == "waiting_sync" and task_id is not None:
+            ready_eta = self._estimate_coalition_ready_eta(task_id, np.zeros(len(self.robot_order), dtype=np.int64))
+            if np.isfinite(ready_eta):
+                return float(ready_eta)
+            return float(self.wait_timeout)
+        if status == "onsite" and task_id is not None:
+            service_eta = self._service_eta_for_task(task_id)
+            return float(service_eta) if np.isfinite(service_eta) else float(self.wait_timeout)
+        return 0.0
+
+    def _task_waiting_count(self, task_id: str, task_state: Dict) -> int:
+        return max(
+            len(task_state.get("onsite_robot_ids", set())) - len(task_state.get("contributors", set())),
+            0,
+        )
+
+    def _robot_available_eta_for_task(self, robot_id: str, task_id: str) -> float:
+        robot = self.robot_states[robot_id]
+        status = robot.get("status")
+        current_task = robot.get("assigned_task")
+        speed = max(0.05, float(robot.get("speed_multiplier", 1.0)))
+        matrix = self.scenario["distance_matrix"]
+
+        if status in {"idle", "waiting_idle"}:
+            return self._estimate_eta(robot_id, task_id)
+
+        if status == "waiting_sync":
+            if current_task == task_id:
+                return 0.0
+            if robot.get("location_type") == "task" and robot.get("location_id") is not None:
+                return float(matrix["task_to_task"][robot["location_id"]][task_id]["base_eta"]) / speed
+            return self._estimate_eta(robot_id, task_id)
+
+        if status == "travel":
+            if current_task == task_id:
+                return float(robot.get("eta_remaining", 0.0))
+            travel_left = float(robot.get("eta_remaining", 0.0))
+            if current_task is None:
+                return travel_left + self._estimate_eta(robot_id, task_id)
+            transfer = float(matrix["task_to_task"][current_task][task_id]["base_eta"]) / speed
+            return travel_left + transfer
+
+        if status == "onsite":
+            if current_task == task_id:
+                return 0.0
+            if current_task is None:
+                return self._estimate_eta(robot_id, task_id)
+            finish_eta = self._service_eta_for_task(current_task)
+            if not np.isfinite(finish_eta):
+                return float("inf")
+            transfer = float(matrix["task_to_task"][current_task][task_id]["base_eta"]) / speed
+            return finish_eta + transfer
+
+        return self._estimate_eta(robot_id, task_id)
+
+    def _estimate_coalition_ready_eta(self, task_id: str, pending_actions: np.ndarray) -> float:
+        task_state = self.task_states[task_id]
+        task = self.task_specs[task_id]
+        if task_state["completed"]:
+            return 0.0
+
+        required_roles = task.get("required_roles", {})
+        if not required_roles:
+            return 0.0
+
+        ready_etas: list[float] = []
+        assignments = pending_task_assignments(self.robot_order, self.task_order, pending_actions)
+        same_task = assignments.get(task_id, set())
+        other_tasks = {
+            robot_id
+            for other_task_id, robot_ids in assignments.items()
+            if other_task_id != task_id
+            for robot_id in robot_ids
+        }
+
+        for role, need in required_roles.items():
+            role_candidates: list[float] = []
+            for robot_id, robot in self.robot_states.items():
+                if robot["role"] != role:
+                    continue
+                if robot_id in other_tasks:
+                    continue
+                eta = self._robot_available_eta_for_task(robot_id, task_id)
+                if robot_id in same_task:
+                    eta = min(eta, self._robot_available_eta_for_task(robot_id, task_id))
+                if np.isfinite(eta):
+                    role_candidates.append(eta)
+            role_candidates = sorted(role_candidates)
+            if len(role_candidates) < need:
+                return float("inf")
+            ready_etas.extend(role_candidates[:need])
+        return max(ready_etas, default=0.0)
+
+    def _predict_task_outcome(self, robot_id: str, task_id: str, pending_actions: np.ndarray) -> tuple[float, float, float]:
+        task = self.task_specs[task_id]
+        robot = self.robot_states[robot_id]
+        direct_eta = float(self._robot_available_eta_for_task(robot_id, task_id))
+        if task["kind"] == "single":
+            finish_eta = direct_eta + float(task["service_time"]) / max(float(robot["service_multiplier"]), EPS)
+            return direct_eta, direct_eta, finish_eta
+
+        assignments = pending_task_assignments(self.robot_order, self.task_order, pending_actions)
+        same_task_pending = set(assignments.get(task_id, set()))
+        other_pending = {
+            pending_robot_id
+            for other_task_id, robot_ids in assignments.items()
+            if other_task_id != task_id
+            for pending_robot_id in robot_ids
+        }
+        required_roles = task.get("required_roles", {})
+        if not required_roles:
+            finish_eta = direct_eta + float(task["service_time"]) / max(float(robot["service_multiplier"]), EPS)
+            return direct_eta, direct_eta, finish_eta
+
+        selected_ids: list[str] = []
+        ready_etas: list[float] = []
+        for role, need in required_roles.items():
+            role_candidates: list[tuple[float, str]] = []
+            for candidate_id, candidate in self.robot_states.items():
+                if candidate["role"] != role:
+                    continue
+                if candidate_id in other_pending:
+                    continue
+                eta = float(self._robot_available_eta_for_task(candidate_id, task_id))
+                if np.isfinite(eta):
+                    role_candidates.append((eta, candidate_id))
+            role_candidates.sort(key=lambda item: item[0])
+
+            chosen = []
+            used = set(selected_ids)
+            for eta, candidate_id in role_candidates:
+                if candidate_id in used:
+                    continue
+                chosen.append((eta, candidate_id))
+                used.add(candidate_id)
+                if len(chosen) >= need:
+                    break
+            if len(chosen) < need:
+                return direct_eta, float("inf"), float("inf")
+            ready_etas.extend(eta for eta, _ in chosen)
+            selected_ids.extend(candidate_id for _, candidate_id in chosen)
+
+        predicted_start = max(ready_etas, default=direct_eta)
+        rate = service_rate(
+            selected_ids,
+            {
+                candidate_id: {"service_multiplier": self.robot_states[candidate_id]["service_multiplier"]}
+                for candidate_id in selected_ids
+            },
+        )
+        predicted_finish = predicted_start + float(task["service_time"]) / max(rate, EPS)
+        return direct_eta, predicted_start, predicted_finish
+
     def _robot_task_eta_matrix(self) -> np.ndarray:
         eta = np.zeros((len(self.robot_order), len(self.task_order)), dtype=np.float32)
         for robot_slot, robot_id in enumerate(self.robot_order):
@@ -422,12 +686,210 @@ class SchedulerNavRunner:
             wait_timeout=self.wait_timeout,
         )
 
+    def _build_hetero_scheduler_obs(self, current_slot: int, pending_actions: np.ndarray) -> Dict[str, np.ndarray]:
+        legal_mask = legal_action_mask_for_robot(
+            robot_id=self.robot_order[current_slot],
+            robot_order=self.robot_order,
+            task_order=self.task_order,
+            robot_states=self.robot_states,
+            task_states=self.task_states,
+            task_specs=self.task_specs,
+            pending_actions=pending_actions,
+            max_tasks=len(self.task_order),
+        )
+        legal_mask = constrain_wait_action_mask(legal_mask, self.robot_states[self.robot_order[current_slot]])
+        deficits = remaining_role_deficit_matrix(
+            task_order=self.task_order,
+            task_specs=self.task_specs,
+            task_states=self.task_states,
+            robot_states=self.robot_states,
+            pending_actions=pending_actions,
+            robot_order=self.robot_order,
+            max_tasks=len(self.task_order),
+        )
+        precedence_state = precedence_state_vector(
+            task_order=self.task_order,
+            task_specs=self.task_specs,
+            task_states=self.task_states,
+            max_tasks=len(self.task_order),
+        )
+        return build_hetero_scheduler_observation(
+            robot_order=self.robot_order,
+            task_order=self.task_order,
+            robot_states=self.robot_states,
+            task_states=self.task_states,
+            task_specs=self.task_specs,
+            current_slot=current_slot,
+            legal_mask=legal_mask,
+            remaining_role_deficits=deficits,
+            precedence_state=precedence_state,
+            robot_release_eta_fn=self._robot_release_eta,
+            predict_task_outcome_fn=lambda robot_id, task_id: self._predict_task_outcome(robot_id, task_id, pending_actions),
+            task_waiting_count_fn=self._task_waiting_count,
+            task_unlock_value_fn=self._task_unlock_value,
+            max_time=float(self.max_frames),
+            max_robots=len(self.robot_order),
+            num_task_tokens=len(self.task_order) + 1,
+        )
+
+    def _upfront_wait_aware_action(self, current_slot: int, pending_actions: np.ndarray) -> int:
+        current_robot_id = self.robot_order[current_slot]
+        legal_mask = legal_action_mask_for_robot(
+            robot_id=current_robot_id,
+            robot_order=self.robot_order,
+            task_order=self.task_order,
+            robot_states=self.robot_states,
+            task_states=self.task_states,
+            task_specs=self.task_specs,
+            pending_actions=pending_actions,
+            max_tasks=len(self.task_order),
+        )
+        legal_mask = constrain_wait_action_mask(legal_mask, self.robot_states[current_robot_id])
+        best_action = 0
+        best_score = float("inf")
+        fallback_action = 0
+        fallback_key: tuple[float, float, int] | None = None
+        has_legal_task = False
+
+        for action in np.flatnonzero(legal_mask > 0.0):
+            if action == 0:
+                continue
+            has_legal_task = True
+            task_id = task_id_from_action(int(action), self.task_order)
+            if task_id is None:
+                continue
+            task = self.task_specs[task_id]
+            eta, predicted_start, predicted_finish = self._predict_task_outcome(current_robot_id, task_id, pending_actions)
+            fallback_eta = eta if np.isfinite(eta) else float("inf")
+            fallback_start = predicted_start if np.isfinite(predicted_start) else float("inf")
+            candidate_key = (fallback_eta, fallback_start, int(action))
+            if fallback_key is None or candidate_key < fallback_key:
+                fallback_key = candidate_key
+                fallback_action = int(action)
+            if not np.isfinite(predicted_finish):
+                continue
+            waiting_gap = max(0.0, predicted_start - eta)
+            unlock_bonus = 20.0 * float(self._task_unlock_value(task_id))
+            priority_bonus = 45.0 * float(task.get("priority", 1.0))
+            single_bias = 10.0 if task["kind"] == "single" else 0.0
+            score = predicted_finish + 0.8 * waiting_gap - unlock_bonus - priority_bonus - single_bias
+            if score < best_score - 1e-6:
+                best_score = score
+                best_action = int(action)
+
+        if best_action != 0:
+            return best_action
+        if has_legal_task:
+            return fallback_action
+        return 0
+
+    def _ranker_has_single_sync_conflict(self, hetero_obs: Dict[str, np.ndarray]) -> bool:
+        global_mask = np.asarray(hetero_obs["global_mask"], dtype=np.float32)
+        task_inputs = np.asarray(hetero_obs["task_inputs"], dtype=np.float32)
+        has_single = False
+        has_sync = False
+        for action in np.flatnonzero(global_mask < 0.5):
+            if int(action) == 0 or int(action) >= task_inputs.shape[0]:
+                continue
+            row = task_inputs[int(action)]
+            if row[TASK_IDX["is_single"]] > 0.5:
+                has_single = True
+            elif row[TASK_IDX["is_sync"]] > 0.5:
+                has_sync = True
+            if has_single and has_sync:
+                return True
+        return False
+
+    def _ranker_is_hard_state(self, hetero_obs: Dict[str, np.ndarray]) -> bool:
+        legal_non_wait = int(np.count_nonzero(np.asarray(hetero_obs["global_mask"][1:], dtype=np.float32) < 0.5))
+        family = str((self.scenario or {}).get("family", ""))
+        if self._ranker_has_single_sync_conflict(hetero_obs):
+            return True
+        if legal_non_wait > 2:
+            return True
+        return family in RANKER_GUARD_FAMILIES
+
+    def _ranker_margin(self, logps: "torch.Tensor", hetero_obs: Dict[str, np.ndarray]) -> float:
+        probs_tensor = logps.detach().exp().cpu()
+        if probs_tensor.ndim > 1:
+            probs_tensor = probs_tensor[0]
+        probs = probs_tensor.tolist()
+        legal_actions = np.flatnonzero(np.asarray(hetero_obs["global_mask"], dtype=np.float32) < 0.5)
+        if legal_actions.size == 0:
+            return 1.0
+        legal_probs = np.asarray([float(probs[int(action)]) for action in legal_actions], dtype=np.float32)
+        if legal_probs.size <= 1:
+            return 1.0
+        top_indices = np.argsort(legal_probs)[-2:]
+        top_probs = np.sort(legal_probs[top_indices])
+        return float(top_probs[-1] - top_probs[-2])
+
+    def _ensure_ranker_guard_metrics(self) -> None:
+        # Tests or ad-hoc callers may invoke _scheduler_action without a full
+        # scenario reset; keep ranker guard counters safe in that case.
+        for key in (
+            "ranker_guard_trigger_count",
+            "ranker_low_margin_count",
+            "ranker_unsafe_checkpoint_count",
+        ):
+            self.metrics.setdefault(key, 0)
+
+    def _record_wait_pattern_metrics(
+        self,
+        robot_id: str,
+        *,
+        robot_status: str,
+        has_legal_task: bool,
+        action: int,
+    ) -> None:
+        robot = self.robot_states[robot_id]
+        action_is_wait = int(action) == 0
+        self.metrics["decision_count"] += 1
+        if action_is_wait:
+            self.metrics["wait_action_count"] += 1
+        if robot_status == "idle" and has_legal_task:
+            self.metrics["idle_legal_decision_count"] += 1
+            if action_is_wait:
+                self.metrics["idle_wait_action_count"] += 1
+        if robot_status == "waiting_idle" and has_legal_task:
+            self.metrics["waiting_idle_legal_decision_count"] += 1
+            legal_streak = int(robot.get("waiting_idle_legal_streak", 0)) + 1
+            robot["waiting_idle_legal_streak"] = legal_streak
+            if action_is_wait:
+                self.metrics["waiting_idle_wait_action_count"] += 1
+                if legal_streak >= 2:
+                    self.metrics["stalled_wait_count"] += 1
+            else:
+                robot["waiting_idle_legal_streak"] = 0
+        else:
+            robot["waiting_idle_legal_streak"] = 0
+
+        previous_wait = robot.get("last_dispatch_was_wait")
+        if has_legal_task and previous_wait is not None and bool(previous_wait) != action_is_wait:
+            self.metrics["wait_flip_count"] += 1
+        if has_legal_task:
+            robot["last_dispatch_was_wait"] = action_is_wait
+
     def _scheduler_action(self, obs: Dict[str, np.ndarray], current_slot: int, pending_actions: np.ndarray) -> int:
         robot_id = self.robot_order[current_slot]
         if isinstance(self.scheduler_policy, str):
             if self.scheduler_policy == "random":
                 valid = np.flatnonzero(obs["current_action_mask"] > 0.0)
                 return int(self.rng.choice(valid)) if len(valid) else 0
+            if self.scheduler_policy == "wait_aware_role_greedy":
+                return wait_aware_role_greedy_action_for_robot(
+                    robot_id=robot_id,
+                    robot_order=self.robot_order,
+                    task_order=self.task_order,
+                    robot_states=self.robot_states,
+                    task_states=self.task_states,
+                    task_specs=self.task_specs,
+                    robot_task_eta_row=self._robot_task_eta_matrix()[current_slot],
+                    pending_actions=pending_actions,
+                    max_tasks=len(self.task_order),
+                )
+            if self.scheduler_policy == "upfront_wait_aware_greedy":
+                return self._upfront_wait_aware_action(current_slot, pending_actions)
             return role_aware_greedy_action_for_robot(
                 robot_id=robot_id,
                 robot_order=self.robot_order,
@@ -440,14 +902,46 @@ class SchedulerNavRunner:
                 max_tasks=len(self.task_order),
             )
 
-        from attention_policy import obs_to_torch
-
-        obs_tensors = obs_to_torch(obs, device="cpu")
-        self.scheduler_policy.eval()
         import torch
 
+        loaded_policy = self.scheduler_policy
+        if isinstance(loaded_policy, LoadedSchedulerPolicy) and loaded_policy.policy_type in {"hetero_ppo", "hetero_actor_only", "hetero_ranker"}:
+            hetero_obs = self._build_hetero_scheduler_obs(current_slot, pending_actions)
+            obs_tensors = hetero_obs_to_torch(hetero_obs, device="cpu")
+            loaded_policy.model.eval()
+            with torch.no_grad():
+                action, _, _ = loaded_policy.model.act(obs_tensors, deterministic=True)
+                action_value = int(action.item())
+                if loaded_policy.policy_type == "hetero_ranker":
+                    self._ensure_ranker_guard_metrics()
+                    _, logps = loaded_policy.model(obs_tensors)
+                    hard_state = self._ranker_is_hard_state(hetero_obs)
+                    low_margin = self._ranker_margin(logps, hetero_obs) < float(self.scheduler_min_margin)
+                    unsafe_checkpoint = not bool(loaded_policy.metadata.get("deploy_ready", False))
+                    guard_enabled = self.scheduler_guard_mode in {"auto", "hard_only"}
+                    if self.scheduler_guard_mode == "auto" and unsafe_checkpoint:
+                        self.metrics["ranker_unsafe_checkpoint_count"] += 1
+                    if guard_enabled and low_margin:
+                        self.metrics["ranker_low_margin_count"] += 1
+                    if guard_enabled and hard_state and low_margin:
+                        safe_action = self._upfront_wait_aware_action(current_slot, pending_actions)
+                        if (
+                            safe_action >= 0
+                            and safe_action < len(hetero_obs["global_mask"])
+                            and hetero_obs["global_mask"][safe_action] < 0.5
+                            and int(safe_action) != action_value
+                        ):
+                            action_value = int(safe_action)
+                            self.metrics["ranker_guard_trigger_count"] += 1
+                return action_value
+
+        from attention_policy import obs_to_torch
+
+        legacy_model = loaded_policy.model if isinstance(loaded_policy, LoadedSchedulerPolicy) else loaded_policy
+        obs_tensors = obs_to_torch(obs, device="cpu")
+        legacy_model.eval()
         with torch.no_grad():
-            action, _, _ = self.scheduler_policy.act(obs_tensors, deterministic=True)
+            action, _, _ = legacy_model.act(obs_tensors, deterministic=True)
         return int(action.item())
 
     def _assign_robot(self, robot_id: str, task_id: str) -> None:
@@ -487,6 +981,7 @@ class SchedulerNavRunner:
         robot["global_path"] = []
         robot["lookahead_wp"] = (robot["x"], robot["y"])
         robot["task_progress"] = 0.0
+        robot["waiting_idle_legal_streak"] = 0
 
     def _dispatch_idle_robots(self) -> None:
         idle_slots = [
@@ -499,13 +994,31 @@ class SchedulerNavRunner:
 
         pending_actions = np.zeros(len(self.robot_order), dtype=np.int64)
         for slot in idle_slots:
+            robot_id = self.robot_order[slot]
+            robot = self.robot_states[robot_id]
             obs = self._build_scheduler_obs(slot, pending_actions)
+            has_legal_task = bool(np.any(obs["current_action_mask"][1:] > 0.0))
             action = self._scheduler_action(obs, slot, pending_actions)
+            if robot["status"] == "waiting_idle" and has_legal_task:
+                waiting_idle_streak = int(robot.get("waiting_idle_legal_streak", 0)) + 1
+                if waiting_idle_streak >= 2:
+                    safe_action = self._upfront_wait_aware_action(slot, pending_actions)
+                    if safe_action > 0 and obs["current_action_mask"][safe_action] > 0.0:
+                        action = safe_action
+                        self.metrics["waiting_idle_fallback_count"] += 1
+            elif robot["status"] != "waiting_idle":
+                robot["waiting_idle_legal_streak"] = 0
             if action < 0 or action > len(self.task_order):
-                action = 0
+                action = fallback_legal_action_from_mask(obs["current_action_mask"])
             if obs["current_action_mask"][action] <= 0.0:
                 self.metrics["illegal_actions"] += 1
-                action = 0
+                action = fallback_legal_action_from_mask(obs["current_action_mask"])
+            self._record_wait_pattern_metrics(
+                robot_id,
+                robot_status=robot["status"],
+                has_legal_task=has_legal_task,
+                action=int(action),
+            )
             pending_actions[slot] = action
 
         for slot in idle_slots:
@@ -695,6 +1208,26 @@ class SchedulerNavRunner:
         return sum(robot["idle_time"] for robot in self.robot_states.values()) / total_time
 
     def _info(self, success: bool, truncated: bool) -> Dict:
+        wait_action_rate = 0.0
+        if self.metrics["decision_count"] > 0:
+            wait_action_rate = self.metrics["wait_action_count"] / self.metrics["decision_count"]
+        idle_wait_rate = 0.0
+        if self.metrics["idle_legal_decision_count"] > 0:
+            idle_wait_rate = self.metrics["idle_wait_action_count"] / self.metrics["idle_legal_decision_count"]
+        waiting_idle_wait_rate = 0.0
+        if self.metrics["waiting_idle_legal_decision_count"] > 0:
+            waiting_idle_wait_rate = (
+                self.metrics["waiting_idle_wait_action_count"] / self.metrics["waiting_idle_legal_decision_count"]
+            )
+        stalled_wait_rate = 0.0
+        if self.metrics["waiting_idle_legal_decision_count"] > 0:
+            stalled_wait_rate = self.metrics["stalled_wait_count"] / self.metrics["waiting_idle_legal_decision_count"]
+        wait_flip_rate = 0.0
+        if self.metrics["decision_count"] > 0:
+            wait_flip_rate = self.metrics["wait_flip_count"] / self.metrics["decision_count"]
+        ranker_guard_fallback_rate = 0.0
+        if self.metrics["decision_count"] > 0:
+            ranker_guard_fallback_rate = self.metrics["ranker_guard_trigger_count"] / self.metrics["decision_count"]
         return {
             "scenario_id": self.scenario["scenario_id"],
             "success": success,
@@ -707,6 +1240,16 @@ class SchedulerNavRunner:
             "deadlock_events": self.metrics["deadlock_events"],
             "timeout_events": self.metrics["timeout_events"],
             "illegal_actions": self.metrics["illegal_actions"],
+            "wait_action_rate": wait_action_rate,
+            "idle_wait_rate": idle_wait_rate,
+            "waiting_idle_wait_rate": waiting_idle_wait_rate,
+            "stalled_wait_rate": stalled_wait_rate,
+            "wait_flip_rate": wait_flip_rate,
+            "waiting_idle_fallback_count": self.metrics["waiting_idle_fallback_count"],
+            "ranker_guard_trigger_count": self.metrics["ranker_guard_trigger_count"],
+            "ranker_low_margin_count": self.metrics["ranker_low_margin_count"],
+            "ranker_unsafe_checkpoint_count": self.metrics["ranker_unsafe_checkpoint_count"],
+            "ranker_guard_fallback_rate": ranker_guard_fallback_rate,
             "completed_order": list(self.completed_order),
             "event_index": self.event_index,
             "frame_index": self.frame_index,

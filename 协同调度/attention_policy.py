@@ -67,8 +67,8 @@ class AttentionSchedulerPolicy(nn.Module):
             dim_feedforward=embed_dim * 4,
             activation="gelu",
         )
-        self.robot_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.task_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.robot_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers, enable_nested_tensor=False)
+        self.task_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers, enable_nested_tensor=False)
         self.task_to_robot = nn.MultiheadAttention(embed_dim, n_heads, dropout=dropout, batch_first=True)
         self.robot_to_task = nn.MultiheadAttention(embed_dim, n_heads, dropout=dropout, batch_first=True)
 
@@ -96,7 +96,7 @@ class AttentionSchedulerPolicy(nn.Module):
     def task_inputs_from_obs(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
         current_robot = obs["current_robot"]
         current_robot_eta = torch.einsum("br,brt->bt", current_robot, obs["robot_task_eta"]).unsqueeze(-1)
-        return torch.cat(
+        task_inputs = torch.cat(
             [
                 obs["tasks"],
                 obs["remaining_role_deficit"],
@@ -104,6 +104,7 @@ class AttentionSchedulerPolicy(nn.Module):
             ],
             dim=-1,
         )
+        return task_inputs[..., : self.task_dim]
 
     def forward(self, obs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         robot_valid = obs["robots"][..., 0] > 0.0
@@ -111,7 +112,7 @@ class AttentionSchedulerPolicy(nn.Module):
         robot_pad = ~robot_valid
         task_pad = ~task_valid
 
-        robot_tokens = self.robot_embed(obs["robots"])
+        robot_tokens = self.robot_embed(obs["robots"][..., : self.robot_dim])
         task_tokens = self.task_embed(self.task_inputs_from_obs(obs))
         robot_tokens = self.robot_encoder(robot_tokens, src_key_padding_mask=robot_pad)
         task_tokens = self.task_encoder(task_tokens, src_key_padding_mask=task_pad)

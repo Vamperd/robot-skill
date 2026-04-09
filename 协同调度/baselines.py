@@ -92,10 +92,52 @@ def role_aware_greedy_policy(env: SchedulingEnv, obs: Dict[str, np.ndarray], rng
     return action
 
 
+def wait_aware_role_greedy_policy(env: SchedulingEnv, obs: Dict[str, np.ndarray], rng: np.random.Generator) -> np.ndarray:
+    action = _empty_action(env)
+    taken_single = set()
+
+    for slot, robot_id in enumerate(env.robot_order):
+        robot = env.robot_states[robot_id]
+        if robot["status"] not in {"idle", "waiting_sync"}:
+            continue
+
+        if robot["status"] == "waiting_sync" and not robot.get("has_better_alternative", False):
+            action[slot] = 0
+            continue
+
+        ranked = []
+        for task_slot, task_id in enumerate(env.task_order, start=1):
+            if not obs["action_mask"][slot, task_slot]:
+                continue
+            task = env.task_specs[task_id]
+            if task["kind"] == "single" and task_id in taken_single:
+                continue
+
+            eta = float(obs["robot_task_eta"][slot, task_slot - 1])
+            role_bonus = 0.25 if robot["role"] in task.get("required_roles", {}) else 0.0
+            priority_bonus = 0.08 * float(task.get("priority", 1.0))
+            sync_bonus = 0.05 if task["kind"] == "sync" else 0.0
+            precedence_penalty = 0.15 * len(task.get("precedence", []))
+            wait_exit_bonus = 0.15 if robot["status"] == "waiting_sync" and task["kind"] == "single" else 0.0
+            score = eta + precedence_penalty - role_bonus - priority_bonus - sync_bonus - wait_exit_bonus
+            ranked.append((score, eta, task_slot, task_id))
+
+        if not ranked:
+            action[slot] = 0
+            continue
+
+        _, _, task_slot, task_id = min(ranked, key=lambda item: (item[0], item[1]))
+        action[slot] = task_slot
+        if env.task_specs[task_id]["kind"] == "single":
+            taken_single.add(task_id)
+    return action
+
+
 POLICIES: Dict[str, PolicyFn] = {
     "random": random_policy,
     "nearest_eta_greedy": nearest_eta_greedy_policy,
     "role_aware_greedy": role_aware_greedy_policy,
+    "wait_aware_role_greedy": wait_aware_role_greedy_policy,
 }
 
 
@@ -129,8 +171,12 @@ def evaluate_policy(
                 "makespan": float(final_info.get("makespan", env.time)),
                 "completion_rate": float(final_info.get("completion_rate", 0.0)),
                 "average_wait_time": float(final_info.get("average_wait_time", 0.0)),
+                "average_avoidable_wait_time": float(final_info.get("average_avoidable_wait_time", 0.0)),
                 "idle_ratio": float(final_info.get("idle_ratio", 0.0)),
                 "deadlock_events": float(final_info.get("deadlock_events", 0.0)),
+                "waiting_sync_reassign_count": float(final_info.get("waiting_sync_reassign_count", 0.0)),
+                "productive_reassign_rate": float(final_info.get("productive_reassign_rate", 0.0)),
+                "coalition_activation_delay": float(final_info.get("coalition_activation_delay", 0.0)),
             }
         )
 
@@ -140,8 +186,12 @@ def evaluate_policy(
         "mean_makespan": mean(item["makespan"] for item in metrics),
         "mean_completion_rate": mean(item["completion_rate"] for item in metrics),
         "mean_wait_time": mean(item["average_wait_time"] for item in metrics),
+        "mean_avoidable_wait_time": mean(item["average_avoidable_wait_time"] for item in metrics),
         "mean_idle_ratio": mean(item["idle_ratio"] for item in metrics),
         "mean_deadlock_events": mean(item["deadlock_events"] for item in metrics),
+        "mean_waiting_sync_reassign_count": mean(item["waiting_sync_reassign_count"] for item in metrics),
+        "mean_productive_reassign_rate": mean(item["productive_reassign_rate"] for item in metrics),
+        "mean_coalition_activation_delay": mean(item["coalition_activation_delay"] for item in metrics),
     }
 
 

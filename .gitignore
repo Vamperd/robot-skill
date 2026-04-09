@@ -6,3 +6,10 @@ improve.md
 HeteroMRTA-main
 协同调度/checkpoints_bc/
 协同调度/checkpoints_rl/
+协同调度/checkpoints_hetero_bc/
+协同调度/checkpoints_hetero_rl/
+协同调度/checkpoints_improve_bc/
+协同调度/checkpoints_improve_rl/
+协同调度/checkpoints_hetero_actor_only
+协同调度/checkpoints_hetero_ranker_1norm
+协同调度/checkpoints_hetero_ranker_ce_only

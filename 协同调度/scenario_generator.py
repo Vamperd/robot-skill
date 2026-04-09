@@ -68,13 +68,14 @@ FAMILY_NAMES = (
     "double_bottleneck",
     "far_near_trap",
     "multi_sync_cluster",
+    "partial_coalition_trap",
 )
 
 DEFAULT_SPLIT_COUNTS = {
-    "train": {family: 200 for family in FAMILY_NAMES},
-    "val": {family: 40 for family in FAMILY_NAMES},
-    "test": {family: 40 for family in FAMILY_NAMES},
-    "stress": {family: 10 for family in FAMILY_NAMES},
+    "train": {**{family: 200 for family in FAMILY_NAMES}, "partial_coalition_trap": 120},
+    "val": {**{family: 40 for family in FAMILY_NAMES}, "partial_coalition_trap": 24},
+    "test": {**{family: 40 for family in FAMILY_NAMES}, "partial_coalition_trap": 24},
+    "stress": {**{family: 10 for family in FAMILY_NAMES}, "partial_coalition_trap": 10},
 }
 
 ROBOT_ROLES = {
@@ -131,6 +132,7 @@ FAMILY_SPECS: Dict[str, FamilySpec] = {
     "double_bottleneck": FamilySpec((4, 6), (7, 9), (2, 3), 0.10, "none"),
     "far_near_trap": FamilySpec((3, 5), (5, 7), (1, 2), 0.20, "far_near"),
     "multi_sync_cluster": FamilySpec((4, 6), (7, 10), (2, 3), 0.25, "light"),
+    "partial_coalition_trap": FamilySpec((4, 5), (6, 8), (2, 2), 0.30, "none"),
 }
 
 
@@ -503,6 +505,38 @@ def _build_multi_sync_cluster_layout(rng: random.Random, stress: bool) -> Layout
     )
 
 
+def _build_partial_coalition_trap_layout(rng: random.Random, stress: bool) -> LayoutBlueprint:
+    obstacles = _border_obstacles() + [
+        _jitter_rect(_rect(300, 120, 40, 320), rng, dx=10, dy=15, dw=0, dh=15),
+        _jitter_rect(_rect(460, 80, 40, 320), rng, dx=10, dy=15, dw=0, dh=15),
+        _jitter_rect(_rect(340, 260, 140, 40), rng, dx=15, dy=10, dw=10, dh=5),
+    ]
+    return LayoutBlueprint(
+        obstacles=obstacles,
+        robot_zones=[
+            _rect(80, 230, 110, 120),
+            _rect(610, 230, 110, 120),
+            _rect(340, 65, 120, 90),
+            _rect(340, 445, 120, 90),
+            _rect(90, 70, 130, 90),
+        ],
+        single_task_zones=[
+            _rect(90, 170, 140, 120),
+            _rect(570, 170, 140, 120),
+            _rect(90, 320, 140, 120),
+            _rect(570, 320, 140, 120),
+            _rect(330, 170, 140, 90),
+            _rect(330, 330, 140, 90),
+        ],
+        sync_task_zones=[
+            _rect(350, 240, 120, 80),
+            _rect(350, 95, 120, 80),
+            _rect(350, 405, 120, 80),
+        ],
+        chokepoint_zones=[_rect(285, 220, 70, 120), _rect(445, 220, 70, 120)],
+    )
+
+
 LAYOUT_BUILDERS = {
     "open_balance": _build_open_balance_layout,
     "role_mismatch": _build_role_mismatch_layout,
@@ -510,6 +544,7 @@ LAYOUT_BUILDERS = {
     "double_bottleneck": _build_double_bottleneck_layout,
     "far_near_trap": _build_far_near_trap_layout,
     "multi_sync_cluster": _build_multi_sync_cluster_layout,
+    "partial_coalition_trap": _build_partial_coalition_trap_layout,
 }
 
 
@@ -653,6 +688,47 @@ def _apply_precedence(
             single_tasks[0]["precedence"] = [sync_tasks[0]["id"]]
 
 
+def _apply_partial_coalition_trap(
+    tasks: List[Dict],
+    robots: Sequence[Dict],
+) -> None:
+    sync_tasks = [task for task in tasks if task["kind"] == "sync"]
+    single_tasks = [task for task in tasks if task["kind"] == "single"]
+    if len(sync_tasks) < 2 or len(robots) < 3:
+        return
+
+    main_sync = min(sync_tasks, key=lambda task: abs(task["pos"][1] - 300))
+    side_syncs = [task for task in sync_tasks if task["id"] != main_sync["id"]]
+    support_sync = side_syncs[0]
+
+    ordered_robots = sorted(
+        robots,
+        key=lambda robot: math.hypot(robot["start_pos"][0] - main_sync["pos"][0], robot["start_pos"][1] - main_sync["pos"][1]),
+    )
+    near_robots = ordered_robots[:2]
+    far_robot = ordered_robots[-1]
+
+    main_required: Dict[str, int] = {}
+    for robot in near_robots + [far_robot]:
+        main_required[robot["role"]] = main_required.get(robot["role"], 0) + 1
+    main_sync["required_roles"] = main_required
+    main_sync["priority"] = 1.9
+
+    support_required: Dict[str, int] = {far_robot["role"]: 1}
+    if len(ordered_robots) >= 4:
+        support_required[ordered_robots[-2]["role"]] = support_required.get(ordered_robots[-2]["role"], 0) + 1
+    support_sync["required_roles"] = support_required
+    support_sync["priority"] = 1.7
+
+    nearby_singles = sorted(
+        single_tasks,
+        key=lambda task: math.hypot(task["pos"][0] - main_sync["pos"][0], task["pos"][1] - main_sync["pos"][1]),
+    )
+    for single_task, robot in zip(nearby_singles[:2], near_robots):
+        single_task["required_roles"] = {robot["role"]: 1}
+        single_task["priority"] = max(float(single_task["priority"]), 1.25)
+
+
 def _build_tasks(
     rng: random.Random,
     family: str,
@@ -720,6 +796,8 @@ def _build_tasks(
         )
 
     _apply_precedence(tasks, robots, family, rng, stress)
+    if family == "partial_coalition_trap":
+        _apply_partial_coalition_trap(tasks, robots)
     return tasks
 
 
