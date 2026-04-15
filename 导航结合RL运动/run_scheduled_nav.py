@@ -28,7 +28,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scheduler-policy",
         default="role_aware_greedy",
-        choices=["role_aware_greedy", "wait_aware_role_greedy", "upfront_wait_aware_greedy", "random"],
+        choices=[
+            "role_aware_greedy",
+            "wait_aware_role_greedy",
+            "upfront_wait_aware_greedy",
+            "random",
+            "auction_mrta",
+            "milp_scheduler_small",
+            "sas",
+            "ctas_d",
+        ],
     )
     parser.add_argument(
         "--scheduler-policy-type",

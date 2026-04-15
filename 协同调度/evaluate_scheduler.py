@@ -99,7 +99,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expert-policy",
         default=None,
-        choices=["upfront_wait_aware_greedy", "rollout_upfront_teacher", "hybrid_upfront_teacher"],
+        choices=[
+            "upfront_wait_aware_greedy",
+            "rollout_upfront_teacher",
+            "hybrid_upfront_teacher",
+            "auction_mrta",
+            "milp_scheduler_small",
+            "sas",
+            "ctas_d",
+        ],
         help="不加载 checkpoint，直接评估纯专家策略。",
     )
     parser.add_argument(
@@ -242,6 +250,22 @@ def main() -> None:
                 deterministic=True,
                 teacher_rollout_depth=args.teacher_rollout_depth,
             )
+            baseline_results["auction_mrta"] = evaluate_hetero_policy_on_scenarios(
+                scenarios=scenarios,
+                policy="auction_mrta",
+                device=device,
+                max_episodes=args.max_episodes,
+                deterministic=True,
+                teacher_rollout_depth=args.teacher_rollout_depth,
+            )
+            baseline_results["sas"] = evaluate_hetero_policy_on_scenarios(
+                scenarios=scenarios,
+                policy="sas",
+                device=device,
+                max_episodes=args.max_episodes,
+                deterministic=True,
+                teacher_rollout_depth=args.teacher_rollout_depth,
+            )
         results["baselines"] = baseline_results
 
         if args.trap_eval and not trap_family_requested and trap_scenarios:
@@ -269,6 +293,20 @@ def main() -> None:
                 trap_baselines["hybrid_upfront_teacher"] = evaluate_hetero_policy_on_scenarios(
                     scenarios=trap_scenarios,
                     policy="hybrid_upfront_teacher",
+                    device=device,
+                    deterministic=True,
+                    teacher_rollout_depth=args.teacher_rollout_depth,
+                )
+                trap_baselines["auction_mrta"] = evaluate_hetero_policy_on_scenarios(
+                    scenarios=trap_scenarios,
+                    policy="auction_mrta",
+                    device=device,
+                    deterministic=True,
+                    teacher_rollout_depth=args.teacher_rollout_depth,
+                )
+                trap_baselines["sas"] = evaluate_hetero_policy_on_scenarios(
+                    scenarios=trap_scenarios,
+                    policy="sas",
                     device=device,
                     deterministic=True,
                     teacher_rollout_depth=args.teacher_rollout_depth,

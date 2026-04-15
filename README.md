@@ -194,6 +194,28 @@ python 导航结合RL运动/run_scheduled_nav.py --scenario-dir offline_maps_v2 
 - `hetero_actor_only`
 - `hetero_ranker`
 
+### 4.6 [实验] 墙壁-only 障碍的 A* + PPO 联调
+
+这条实验线用于排除机器人间互避对联调结果的干扰，只验证：
+
+- 高层调度仍按原路线派单
+- A* 仍只对墙壁/静态障碍规划
+- 底层 PPO 仍负责跟踪 waypoint
+- 机器人之间不互避、不碰撞、可重叠穿过
+
+它是独立于正式联调路径的平行实验，不会改动现有 `导航结合RL运动/run_scheduled_nav.py` 的使用方式。
+
+实验命令：
+
+```bash
+python 实验/无互避A星PPO联调/run_scheduled_nav_no_robot_avoid.py --scenario-dir offline_maps_v2 --split stress --limit 1 --scheduler-model 协同调度/checkpoints_hetero_ranker_ce_only/best_scheduler_ranker.pt --scheduler-policy-type hetero_ranker --low-level-model 无导航纯RL底层运动器/results/generalization_eval_best_vel_punishment_狭窄距离，效果最好，可过U形弯/best_model.zip --render --gif-name demo_no_robot_avoid.gif
+```
+
+提醒：
+
+- 这条实验线仅用于验证与排障，不替代正式联调结论
+- 正式联调仍以 `导航结合RL运动/run_scheduled_nav.py` 为准
+
 ## 5. 关键输出文件怎么读
 
 ### 5.1 `teacher_val_reference.json`
@@ -293,3 +315,33 @@ python 协同调度/train_scheduler_hetero_ppo.py --scenario-dir offline_maps_v2
 - `hetero_bc` 卡住的根因不是教师弱，而是 pointer-BC 的目标与模型头不适合当前任务
 - `hetero_ranker` 的成功点在于 masked action ranking 更贴近 `single vs sync` 的边界比较
 - 当前真正需要继续稳定的是 ranker 的后半程训练，而不是接口或联调链路
+
+## 9. [ʵ��] ��ͳ�滮����
+
+��ǰ�Ѿ�����������ͨ�����нӿڵ��õĴ�ͳ�滮���ߣ�
+
+- `auction_mrta`
+  - ������ͳ�������
+  - ��ֱ�ӽ���ȫ��ģ����������
+- `milp_scheduler_small`
+  - С��ģ��ȷ�Ż�����
+  - ������ѡ `PuLP + CBC`
+  - �������� `small / medium` �Ӽ�����ʽ����
+
+���� `auction_mrta`��
+
+```bash
+python Эͬ����/evaluate_scheduler.py --expert-policy auction_mrta --policy-type hetero_ranker --scenario-dir offline_maps_v2 --split test --save-json �ɹ�/json/auction_test_eval.json
+```
+
+���� `milp_scheduler_small`��
+
+```bash
+python Эͬ����/evaluate_scheduler.py --expert-policy milp_scheduler_small --policy-type hetero_ranker --scenario-dir offline_maps_v2 --split test --max-episodes 32 --save-json �ɹ�/json/milp_small_eval.json
+```
+
+˵����
+
+- `auction_mrta` �ʺ���Ϊ���������� hard / trap ���Ĵ�ͳ�滮����
+- `milp_scheduler_small` �����Զ����� `--include-baselines`
+- `milp_scheduler_small` ��ȱ�� `PuLP + CBC`����������ʱֱ�ӱ���������

@@ -18,6 +18,9 @@ CURRENT_DIR = Path(__file__).resolve().parent
 SCHED_DIR = CURRENT_DIR.parent / "协同调度"
 if str(SCHED_DIR) not in sys.path:
     sys.path.insert(0, str(SCHED_DIR))
+PLANNER_DIR = CURRENT_DIR.parent / "实验" / "传统规划基线"
+if str(PLANNER_DIR) not in sys.path:
+    sys.path.insert(0, str(PLANNER_DIR))
 
 from scheduler_utils import (  # noqa: E402
     build_scheduler_observation,
@@ -47,6 +50,7 @@ from coop_docking import (  # noqa: E402
     generate_docking_slots,
 )
 from task_runtime import ContinuousTaskRuntime, service_rate  # noqa: E402
+from planner_baselines import is_planner_policy_name, load_planner_policy  # noqa: E402
 
 
 WHITE = (240, 240, 240)
@@ -100,7 +104,11 @@ class SchedulerNavRunner:
         render: bool = False,
         gif_path: str | None = None,
     ):
-        self.scheduler_policy = scheduler_policy
+        self.scheduler_policy = (
+            load_planner_policy(scheduler_policy)
+            if isinstance(scheduler_policy, str) and is_planner_policy_name(scheduler_policy)
+            else scheduler_policy
+        )
         self.low_level_adapter = low_level_adapter
         self.wait_timeout = wait_timeout
         self.max_frames = max_frames
@@ -254,6 +262,8 @@ class SchedulerNavRunner:
                 raise ValueError(f"协同任务 {task_id} 缺少足够停靠位，无法联调。")
         if self.low_level_adapter is not None:
             self.low_level_adapter.reset(self.robot_order)
+        if hasattr(self.scheduler_policy, "reset_episode"):
+            self.scheduler_policy.reset_episode(scenario)
 
     def _build_task_slots(self, task: Dict) -> List[Tuple[float, float]]:
         if task.get("kind") != "sync":
@@ -905,6 +915,19 @@ class SchedulerNavRunner:
         import torch
 
         loaded_policy = self.scheduler_policy
+        if hasattr(loaded_policy, "select_action"):
+            legal_mask = legal_action_mask_for_robot(
+                robot_id=robot_id,
+                robot_order=self.robot_order,
+                task_order=self.task_order,
+                robot_states=self.robot_states,
+                task_states=self.task_states,
+                task_specs=self.task_specs,
+                pending_actions=pending_actions,
+                max_tasks=len(self.task_order),
+            )
+            legal_mask = constrain_wait_action_mask(legal_mask, self.robot_states[robot_id])
+            return int(loaded_policy.select_action(self, obs, current_slot, legal_mask, self.rng))
         if isinstance(loaded_policy, LoadedSchedulerPolicy) and loaded_policy.policy_type in {"hetero_ppo", "hetero_actor_only", "hetero_ranker"}:
             hetero_obs = self._build_hetero_scheduler_obs(current_slot, pending_actions)
             obs_tensors = hetero_obs_to_torch(hetero_obs, device="cpu")

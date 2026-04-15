@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from pathlib import Path
 from statistics import mean
 from typing import Dict, Iterable, List, Sequence
 
@@ -10,6 +11,15 @@ from torch.utils.data import Dataset
 
 from hetero_attention_policy import HeteroActorOnlyPolicy, HeteroAttentionSchedulerPolicy, HeteroRankerPolicy, obs_to_torch
 from hetero_dispatch_env import HeteroDispatchEnv, TASK_IDX
+
+
+CURRENT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = CURRENT_DIR.parent
+PLANNER_DIR = REPO_ROOT / "实验" / "传统规划基线"
+if str(PLANNER_DIR) not in __import__("sys").path:
+    __import__("sys").path.insert(0, str(PLANNER_DIR))
+
+from planner_baselines import is_planner_policy_name, load_planner_policy  # noqa: E402
 
 
 HeteroPolicy = HeteroAttentionSchedulerPolicy | HeteroActorOnlyPolicy | HeteroRankerPolicy
@@ -166,28 +176,43 @@ def evaluate_policy_on_scenarios(
     env = HeteroDispatchEnv(scenarios=scenarios)
     episode_count = min(len(scenarios), max_episodes) if max_episodes is not None else len(scenarios)
     metrics = []
+    planner_policy = load_planner_policy(policy) if isinstance(policy, str) and is_planner_policy_name(policy) else None
 
     for episode_index in range(episode_count):
         obs, _ = env.reset(options={"scenario": scenarios[episode_index]})
+        if planner_policy is not None:
+            planner_policy.reset_episode(scenarios[episode_index])
         done = False
         truncated = False
         final_info = {}
 
         while not (done or truncated):
-            action = policy_action(
-                env,
-                obs,
-                policy=policy,
-                rng=rng,
-                device=device,
-                deterministic=deterministic,
-                teacher_rollout_depth=teacher_rollout_depth,
-            )
+            if planner_policy is not None:
+                legal_mask = (np.asarray(obs["global_mask"], dtype=np.float32) < 0.5).astype(np.float32)
+                action = int(
+                    planner_policy.select_action(
+                        env,
+                        obs,
+                        int(obs["current_agent_index"][0]),
+                        legal_mask,
+                        rng,
+                    )
+                )
+            else:
+                action = policy_action(
+                    env,
+                    obs,
+                    policy=policy,
+                    rng=rng,
+                    device=device,
+                    deterministic=deterministic,
+                    teacher_rollout_depth=teacher_rollout_depth,
+                )
             obs, _, done, truncated, final_info = env.step(action)
 
         metrics.append(_episode_metrics(final_info, env, done, truncated))
 
-    return {
+    results = {
         "episodes": float(episode_count),
         "success_rate": mean(item["success"] for item in metrics),
         "mean_makespan": mean(item["makespan"] for item in metrics),
@@ -205,6 +230,13 @@ def evaluate_policy_on_scenarios(
         "mean_wait_flip_rate": mean(item["wait_flip_rate"] for item in metrics),
         "mean_dispatch_gap_penalty": mean(item["dispatch_gap_penalty"] for item in metrics),
     }
+    if planner_policy is not None:
+        diagnostics = dict(planner_policy.get_diagnostics())
+        results["planner_diagnostics"] = diagnostics
+        for key, value in diagnostics.items():
+            if isinstance(value, (int, float)):
+                results[key] = float(value)
+    return results
 
 
 def evaluate_policy_family_breakdown(
