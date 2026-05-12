@@ -1,0 +1,42 @@
+{
+  "model_path": null,
+  "expert_policy": "upfront_wait_aware_greedy",
+  "policy_type": "hetero_ranker",
+  "checkpoint_metadata": {},
+  "scheduler": {
+    "episodes": 264.0,
+    "success_rate": 1.0,
+    "mean_makespan": 780.2628528718116,
+    "mean_completion_rate": 1.0,
+    "mean_wait_time": 42.690005188963575,
+    "mean_avoidable_wait_time": 2.985613886051771,
+    "mean_idle_ratio": 0.2979057207839969,
+    "mean_deadlock_events": 0.0,
+    "mean_coalition_activation_delay": 154.22083533513467,
+    "mean_direct_sync_misassignment_rate": 0.011793246736428554,
+    "mean_wait_action_rate": 0.6285295392075292,
+    "mean_idle_wait_rate": 0.0,
+    "mean_waiting_idle_wait_rate": 0.0,
+    "mean_stalled_wait_rate": 0.0,
+    "mean_wait_flip_rate": 0.0,
+    "mean_dispatch_gap_penalty": 0.0
+  },
+  "trap_subset": {
+    "episodes": 24.0,
+    "success_rate": 1.0,
+    "mean_makespan": 800.1405182977788,
+    "mean_completion_rate": 1.0,
+    "mean_wait_time": 91.51031744196254,
+    "mean_avoidable_wait_time": 1.5955332461084273,
+    "mean_idle_ratio": 0.24259753360141292,
+    "mean_deadlock_events": 0.0,
+    "mean_coalition_activation_delay": 257.4799859191407,
+    "mean_direct_sync_misassignment_rate": 0.01790674603174603,
+    "mean_wait_action_rate": 0.5392849133449947,
+    "mean_idle_wait_rate": 0.0,
+    "mean_waiting_idle_wait_rate": 0.0,
+    "mean_stalled_wait_rate": 0.0,
+    "mean_wait_flip_rate": 0.0,
+    "mean_dispatch_gap_penalty": 0.0
+  }
+}

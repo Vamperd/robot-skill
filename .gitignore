@@ -13,3 +13,4 @@ HeteroMRTA-main
 协同调度/checkpoints_hetero_actor_only
 协同调度/checkpoints_hetero_ranker_1norm
 协同调度/checkpoints_hetero_ranker_ce_only
+协同调度/checkpoints_hetero_ranker_ce_only_best
